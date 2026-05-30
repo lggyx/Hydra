@@ -615,7 +615,7 @@ hydra/
 │   │   │   ├── reviewer.rs     # ReviewerAgent (optional)
 │   │   │   ├── provider/       # LlmProvider trait + implementations
 │   │   │   │   ├── mod.rs
-│   │   │   │   ├── openai.rs   # OpenAI / DeepSeek / 硅基流动
+│   │   │   │   ├── openai.rs   # OpenAI / DeepSeek
 │   │   │   │   ├── anthropic.rs # Claude
 │   │   │   │   └── ollama.rs    # Local models
 │   │   │   ├── tools/          # Tool trait + built-in tools
