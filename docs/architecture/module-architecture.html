@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Hydra Module Architecture</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #0f1117;
+    color: #e6e6e6;
+    padding: 32px;
+    line-height: 1.6;
+  }
+  h1 { font-size: 22px; margin-bottom: 4px; color: #fff; }
+  h2 { font-size: 16px; margin: 32px 0 12px; color: #93c5fd; border-bottom: 1px solid #1f2937; padding-bottom: 6px; }
+  h3 { font-size: 14px; margin: 20px 0 8px; color: #d1d5db; }
+  .subtitle { color: #9ca3af; font-size: 13px; margin-bottom: 24px; }
+
+  /* ── Module boxes ── */
+  .module {
+    border: 1px solid #374151;
+    border-radius: 8px;
+    background: #111827;
+    padding: 14px 16px;
+    position: relative;
+  }
+  .module-title {
+    font-weight: 600;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .badge {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+  }
+  .badge-cli     { background: #4b5563; color: #fff; }
+  .badge-daemon  { background: #dc2626; color: #fff; }
+  .badge-core    { background: #2563eb; color: #fff; }
+  .badge-workspace { background: #d97706; color: #fff; }
+  .badge-ext     { background: #7c3aed; color: #fff; }
+  .badge-external { background: #374151; color: #9ca3af; border: 1px solid #4b5563; }
+
+  .sub-module {
+    background: #1f2937;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 6px 0;
+  }
+  .sub-title {
+    font-size: 11px;
+    color: #9ca3af;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .file-list {
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 11px;
+    color: #d1d5db;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .file-tag {
+    background: #111827;
+    border: 1px solid #374151;
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #93c5fd;
+  }
+
+  /* ── Interface tables ── */
+  .iface-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11.5px;
+    margin-top: 4px;
+  }
+  .iface-table th {
+    text-align: left;
+    color: #9ca3af;
+    font-weight: 600;
+    padding: 4px 8px;
+    border-bottom: 1px solid #374151;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+  .iface-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid #1f2937;
+    vertical-align: top;
+  }
+  .iface-table tr:last-child td { border-bottom: none; }
+  .iface-table td:first-child {
+    color: #f9a8d4;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .iface-table td:nth-child(2) {
+    color: #86efac;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 11px;
+  }
+  .iface-table td:nth-child(3) {
+    color: #fcd34d;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 11px;
+  }
+  .iface-table td:last-child {
+    color: #9ca3af;
+    font-size: 11px;
+  }
+  .arrow-label {
+    font-size: 10px;
+    color: #6b7280;
+    text-align: center;
+    padding: 2px 0;
+    font-style: italic;
+  }
+
+  /* ── Grid layout ── */
+  .grid {
+    display: grid;
+    gap: 12px;
+  }
+  .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .grid-2 { grid-template-columns: 1fr 1fr; }
+  .grid-1 { grid-template-columns: 1fr; }
+
+  /* ── Arrow connectors (visual only) ── */
+  .connector {
+    text-align: center;
+    padding: 4px 0;
+    color: #6b7280;
+    font-size: 18px;
+  }
+  .connector-label {
+    font-size: 10px;
+    color: #6b7280;
+    text-align: center;
+    padding: 0;
+    font-style: italic;
+  }
+
+  /* ── Layer labels ── */
+  .layer-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #6b7280;
+    font-weight: 700;
+    margin-bottom: 8px;
+    padding-left: 4px;
+  }
+
+  /* ── Code ── */
+  code {
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    background: #1f2937;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+  pre {
+    background: #111827;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    padding: 12px;
+    overflow-x: auto;
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+    color: #d1d5db;
+  }
+
+  /* ── Color helpers ── */
+  .text-blue { color: #60a5fa; }
+  .text-green { color: #4ade80; }
+  .text-yellow { color: #fcd34d; }
+  .text-pink { color: #f472b6; }
+  .text-purple { color: #c084fc; }
+  .text-orange { color: #fb923c; }
+  .text-gray { color: #9ca3af; }
+
+  /* ── Section divider ── */
+  .divider {
+    border: none;
+    border-top: 1px solid #1f2937;
+    margin: 24px 0;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 1100px) {
+    .grid-3 { grid-template-columns: 1fr; }
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Hydra 模块架构图</h1>
+<p class="subtitle">Module Architecture · Interface Contracts · Communication Flow<br>Version 0.1.0-draft · 2026-05-30</p>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!--  LAYER 0: EXTERNAL DEPENDENCIES                                -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2>Layer 0 — 外部依赖 (External Dependencies)</h2>
+<div class="grid grid-3">
+
+  <div class="module">
+    <div class="module-title">
+      <span class="badge badge-external">EXTERNAL</span>
+      hydra-core
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">提供的核心能力</div>
+      <div class="file-list">
+        <span class="file-tag">LlmProvider</span>
+        <span class="file-tag">Tool trait</span>
+        <span class="file-tag">ToolRegistry</span>
+        <span class="file-tag">TurnRunner</span>
+        <span class="file-tag">Conversation</span>
+        <span class="file-tag">ToolContext</span>
+        <span class="file-tag">ScopedReadFile</span>
+        <span class="file-tag">TurnEvent</span>
+      </div>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">Hydra 依赖的接口</div>
+      <table class="iface-table">
+        <tr><th>调用</th><th>返回</th><th>说明</th></tr>
+        <tr><td>provider.chat()</td><td>Response</td><td>LLM 调用</td></tr>
+        <tr><td>tool.execute(ctx)</td><td>ToolResult</td><td>工具执行</td></tr>
+        <tr><td>runner.run()</td><td>TurnEvent</td><td>对话循环</td></tr>
+        <tr><td>ctx.read_file(path)</td><td>String</td><td>范围受限读取</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="module">
+    <div class="module-title">
+      <span class="badge badge-external">EXTERNAL</span>
+      iso-code <span class="text-gray">(ISO-Framework fork)</span>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">Fork 来源</div>
+      <div class="file-list">
+        <span class="file-tag">snehith01001110/ISO-Framework</span>
+      </div>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">Hydra 依赖的接口（通过 adapter）</div>
+      <table class="iface-table">
+        <tr><th>调用</th><th>返回</th><th>说明</th></tr>
+        <tr><td>manager.create()</td><td>(Handle, Info)</td><td>创建 worktree</td></tr>
+        <tr><td>manager.delete()</td><td>Result&lt;()&gt;</td><td>5 步安全检查后删除</td></tr>
+        <tr><td>manager.gc()</td><td>GcReport</td><td>垃圾回收</td></tr>
+        <tr><td>manager.list()</td><td>Vec&lt;Info&gt;</td><td>列出活跃 worktree</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="module">
+    <div class="module-title">
+      <span class="badge badge-external">EXTERNAL</span>
+      LLM Providers
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">支持的提供方</div>
+      <div class="file-list">
+        <span class="file-tag">OpenAI (GPT-4o)</span>
+        <span class="file-tag">Anthropic (Claude)</span>
+        <span class="file-tag">DeepSeek</span>
+        <span class="file-tag">Ollama (本地)</span>
+      </div>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">统一接口（LlmProvider trait）</div>
+      <table class="iface-table">
+        <tr><th>调用</th><th>返回</th><th>说明</th></tr>
+        <tr><td>chat(request)</td><td>Stream&lt;Chunk&gt;</td><td>流式对话</td></tr>
+        <tr><td>models()</td><td>Vec&lt;Model&gt;</td><td>可用模型列表</td></tr>
+        <tr><td>supports_tools()</td><td>bool</td><td>是否支持 function call</td></tr>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<hr class="divider"/>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!--  LAYER 1: ENTRY POINTS                                         -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2>Layer 1 — 入口层 (Entry Points)</h2>
+<div class="grid grid-2">
+
+  <div class="module">
+    <div class="module-title">
+      <span class="badge badge-cli">CRATE</span>
+      hydra-cli
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">文件</div>
+      <div class="file-list">
+        <span class="file-tag">src/main.rs</span>
+        <span class="file-tag">src/commands.rs</span>
+        <span class="file-tag">src/tui.rs</span>
+      </div>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">对外接口（CLI commands）</div>
+      <table class="iface-table">
+        <tr><th>命令</th><th>参数</th><th>返回</th><th>说明</th></tr>
+        <tr><td>hydra serve</td><td>--port</td><td>—</td><td>启动 daemon</td></tr>
+        <tr><td>hydra run</td><td>&lt;task&gt; --model</td><td>TaskResult</td><td>提交任务</td></tr>
+        <tr><td>hydra workers</td><td>--status</td><td>Vec&lt;Snapshot&gt;</td><td>列出 worker</td></tr>
+        <tr><td>hydra open</td><td>&lt;id&gt;</td><td>—</td><td>在 VSCode 打开 worktree</td></tr>
+        <tr><td>hydra kill</td><td>&lt;id&gt; --reason</td><td>Result</td><td>终止 Agent</td></tr>
+        <tr><td>hydra promote</td><td>&lt;id&gt; --to</td><td>Result</td><td>合并分支</td></tr>
+        <tr><td>hydra status</td><td>—</td><td>Overview</td><td>全局状态</td></tr>
+      </table>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">→ hydra-core 接口</div>
+      <table class="iface-table">
+        <tr><th>调用</th><th>参数</th><th>返回</th></tr>
+        <tr><td>ResourceManager::spawn()</td><td>kind, spec</td><td>AgentHandle</td></tr>
+        <tr><td>ResourceManager::send_command()</td><td>id, AgentCommand</td><td>Result&lt;()&gt;</td></tr>
+        <tr><td>ResourceManager::snapshots()</td><td>—</td><td>Vec&lt;AgentSnapshot&gt;</td></tr>
+        <tr><td>ResourceManager::subscribe()</td><td>—</td><td>Receiver&lt;AgentEvent&gt;</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="module">
+    <div class="module-title">
+      <span class="badge badge-daemon">CRATE</span>
+      hydra-daemon
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">文件</div>
+      <div class="file-list">
+        <span class="file-tag">src/lib.rs</span>
+        <span class="file-tag">src/api.rs</span>
+        <span class="file-tag">src/ws.rs</span>
+        <span class="file-tag">src/snapshot.rs</span>
+      </div>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">REST 接口</div>
+      <table class="iface-table">
+        <tr><th>Method</th><th>Path</th><th>Body</th><th>返回</th></tr>
+        <tr><td>GET</td><td>/api/v1/agents</td><td>—</td><td>Vec&lt;AgentSnapshot&gt;</td></tr>
+        <tr><td>GET</td><td>/api/v1/agents/:id</td><td>—</td><td>AgentSnapshot</td></tr>
+        <tr><td>GET</td><td>/api/v1/agents/:id/events</td><td>—</td><td>Vec&lt;AgentEvent&gt;</td></tr>
+        <tr><td>POST</td><td>/api/v1/agents/:id/open</td><td>{}</td><td>{worktree_path}</td></tr>
+        <tr><td>POST</td><td>/api/v1/agents/:id/kill</td><td>{reason?}</td><td>{success}</td></tr>
+        <tr><td>POST</td><td>/api/v1/agents/:id/promote</td><td>{to_branch?}</td><td>{success, branch}</td></tr>
+        <tr><td>GET</td><td>/api/v1/worktrees</td><td>—</td><td>Vec&lt;WorktreeInfo&gt;</td></tr>
+        <tr><td>GET</td><td>/api/v1/branches</td><td>—</td><td>Vec&lt;BranchInfo&gt;</td></tr>
+      </table>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">WebSocket 接口</div>
+      <table class="iface-table">
+        <tr><th>方向</th><th>消息格式</th><th>说明</th></tr>
+        <tr><td>Server → Client</td><td>AgentEvent (JSON)</td><td>实时事件流</td></tr>
+        <tr><td>Client → Server</td><td>{"action":"kill","agent_id":N}</td><td>控制指令</td></tr>
+        <tr><td>Client → Server</td><td>{"action":"open_vscode","agent_id":N}</td><td>打开 worktree</td></tr>
+        <tr><td>Client → Server</td><td>{"action":"subscribe"}</td><td>订阅事件</td></tr>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<div class="connector">│</div>
+<div class="connector-label">hydra-cli 和 hydra-daemon 都依赖 hydra-core</div>
+<div class="connector">│</div>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!--  LAYER 2: CORE                                                -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2>Layer 2 — 核心层 (hydra-core)</h2>
+
+<div class="layer-label">▸ 模块 A：Agent 定义</div>
+<div class="module">
+  <div class="module-title">
+    <span class="badge badge-core">CRATE</span>
+    hydra-core / agent/
+  </div>
+  <div class="sub-module">
+    <div class="sub-title">文件</div>
+    <div class="file-list">
+      <span class="file-tag">mod.rs</span>
+      <span class="file-tag">execution.rs</span>
+      <span class="file-tag">orchestrator.rs</span>
+      <span class="file-tag">reviewer.rs</span>
+    </div>
+  </div>
+  <div class="sub-module">
+    <div class="sub-title">核心 trait 定义</div>
+    <pre><code>#[async_trait]
+pub trait Agent: Send + Sync {
+    fn id(&self) -&gt; AgentId;                     // u64, 全局唯一
+    fn kind(&self) -&gt; AgentKind;                 // Execution / Orchestrator / Reviewer
+    fn state(&self) -&gt; &AgentState;              // 只读快照
+    fn branch(&self) -&gt; Option&lt;&str&gt;;           // git 分支名
+    fn worktree(&self) -&gt; Option&lt;&Path&gt;;        // worktree 路径
+
+    async fn run(&mut self, resources: ResourceHandle) -> Result<AgentOutcome>;
+    async fn on_command(&mut self, AgentCommand) -&gt; AgentResponse;
+}</code></pre>
+  </div>
+  <div class="sub-module">
+    <div class="sub-title">类型定义</div>
+    <table class="iface-table">
+      <tr><th>类型</th><th>字段</th><th>说明</th></tr>
+      <tr><td>AgentId</td><td>u64</td><td>全局唯一，单调递增</td></tr>
+      <tr><td>AgentKind</td><td>enum</td><td>Execution / Orchestrator / Reviewer / Custom</td></tr>
+      <tr><td>AgentState</td><td>id, kind, status, created_at, updated_at</td><td>共享可观测状态</td></tr>
+      <tr><td>AgentStatus</td><td>enum</td><td>Created / Running / Paused / Completed / Killed / Failed</td></tr>
+      <tr><td>AgentSpec</td><td>kind, model, files, task</td><td>spawn 时的参数</td></tr>
+      <tr><td>AgentOutcome</td><td>success, edited_files, summary, metrics</td><td>run() 返回值</td></tr>
+      <tr><td>AgentMetrics</td><td>turns, edits, tokens, duration, compile, tests</td><td>运行指标</td></tr>
+    </table>
+  </div>
+</div>
+
+<div class="layer-label">▸ 模块 B：事件与命令</div>
+<div class="module">
+  <div class="module-title">
+    <span class="badge badge-core">CRATE</span>
+    hydra-core / event.rs
+  </div>
+  <div class="sub-module">
+    <div class="sub-title">AgentEvent（Agent → ResourceManager → 订阅者）</div>
+    <table class="iface-table">
+      <tr><th>Variant</th><th>Payload</th><th>来源</th></tr>
+      <tr><td>Started</td><td>agent_id, kind</td><td>所有 Agent</td></tr>
+      <tr><td>Completed</td><td>agent_id, outcome</td><td>所有 Agent</td></tr>
+      <tr><td>Killed</td><td>agent_id, reason</td><td>所有 Agent</td></tr>
+      <tr><td>Turn</td><td>agent_id, TurnEvent</td><td>ExecutionAgent</td></tr>
+      <tr><td>ToolCall</td><td>agent_id, tool, success</td><td>ExecutionAgent</td></tr>
+      <tr><td>Decision</td><td>agent_id, Vec&lt;HarnessCommand&gt;</td><td>OrchestratorAgent</td></tr>
+      <tr><td>TaskSpawned</td><td>agent_id, child_id, desc</td><td>OrchestratorAgent</td></tr>
+      <tr><td>ReviewResult</td><td>agent_id, score, verdict</td><td>ReviewerAgent</td></tr>
+    </table>
+  </div>
+  <div class="sub-module">
+    <div class="sub-title">AgentCommand（ResourceManager → Agent）</div>
+    <table class="iface-table">
+      <tr><th>Variant</th><th>Payload</th><th>目标 Agent</th></tr>
+      <tr><td>Kill</td><td>reason: String</td><td>所有</td></tr>
+      <tr><td>Pause / Resume</td><td>—</td><td>所有</td></tr>
+      <tr><td>InjectHint</td><td>text: String</td><td>ExecutionAgent</td></tr>
+      <tr><td>SwitchModel</td><td>provider, model: String</td><td>ExecutionAgent</td></tr>
+      <tr><td>SubmitTask</td><td>description: String</td><td>OrchestratorAgent</td></tr>
+      <tr><td>SetPolicy</td><td>policy: Policy</td><td>OrchestratorAgent</td></tr>
+      <tr><td>ReviewTarget</td><td>branch: String, scope: Vec&lt;String&gt;</td><td>ReviewerAgent</td></tr>
+    </table>
+  </div>
+  <div class="sub-module">
+    <div class="sub-title">AgentResponse（Agent 对指令的响应）</div>
+    <table class="iface-table">
+      <tr><th>Variant</th><th>Payload</th><th>含义</th></tr>
+      <tr><td>Ack</td><td>—</td><td>已接受，将执行</td></tr>
+      <tr><td>Reject</td><td>reason: String</td><td>拒绝执行（附带原因）</td></tr>
+    </table>
+  </div>
+</div>
+
+<div class="layer-label">▸ 模块 C：ResourceManager（路由器）</div>
+<div class="module">
+  <div class="module-title">
+    <span class="badge badge-core">CRATE</span>
+    hydra-core / resource.rs
+  </div>
+  <div class="sub-module">
+    <div class="sub-title">结构体定义</div>
+pub struct ResourceManager {
+    agents:         Arc<RwLock<AgentRegistry>>,
+    event_rx:       mpsc::UnboundedReceiver<AgentEvent>,
+    event_bus:      mpsc::UnboundedSender<AgentEvent>,   // fan-out to subscribers
+    subscribers:    Arc<RwLock<Vec<UnboundedSender<AgentEvent>>>>,
+    control_senders: Arc<RwLock<HashMap<AgentId, UnboundedSender<AgentCommand>>>>,
+    next_id:        AtomicU64,
+    git:            Arc<dyn GitWorktreeManager>,          // trait object, mockable
+    providers:      Arc<RwLock<ProviderRegistry>>,
+    tool_registry:  Arc<RwLock<ToolRegistry>>,
+}
+  </div>
+  <div class="sub-module">
+    <div class="sub-title">公开方法（接口契约）</div>
+    <table class="iface-table">
+      <tr><th>方法</th><th>参数</th><th>返回</th><th>调用方</th></tr>
+      <tr><td>spawn()</td><td>AgentKind, AgentSpec</td><td>Result&lt;AgentHandle&gt;</td><td>OrchestratorAgent, CLI</td></tr>
+      <tr><td>send_command()</td><td>AgentId, AgentCommand</td><td>Result&lt;()&gt;</td><td>OrchestratorAgent, Daemon, CLI</td></tr>
+      <tr><td>subscribe()</td><td>—</td><td>Receiver&lt;AgentEvent&gt;</td><td>Daemon, TUI, VSCode</td></tr>
+      <tr><td>snapshot()</td><td>AgentId</td><td>Option&lt;AgentSnapshot&gt;</td><td>Daemon, OrchestratorAgent</td></tr>
+      <tr><td>snapshots()</td><td>—</td><td>Vec&lt;AgentSnapshot&gt;</td><td>Daemon, OrchestratorAgent</td></tr>
+      <tr><td>cleanup()</td><td>AgentId</td><td>Result&lt;()&gt;</td><td>内部（Agent 结束后）</td></tr>
+    </table>
+  </div>
+</div>
+
+<div class="layer-label">▸ 模块 D：Agent 实现</div>
+<div class="grid grid-3">
+
+  <div class="module">
+    <div class="module-title">
+      <span class="badge badge-core">AGENT</span>
+      ExecutionAgent
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">字段</div>
+      <pre><code>id, branch, worktree
+conversation: Conversation
+runner: TurnRunner
+tool_ctx: ToolContext       // cwd = worktree
+tool_reg: ToolRegistry      // 范围限制
+state: Arc&lt;RwLock&lt;AgentState&gt;&gt;
+event_tx: Sender&lt;AgentEvent&gt;
+control_rx: Receiver&lt;AgentCommand&gt;</code></pre>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">→ ResourceManager</div>
+      <table class="iface-table">
+        <tr><th>调用</th><th>参数</th><th>时机</th></tr>
+        <tr><td>event_tx.send()</td><td>AgentEvent</td><td>每轮 LLM 响应 / 工具执行</td></tr>
+        <tr><td>control_rx.recv()</td><td>AgentCommand</td><td>tokio::select! 非阻塞检查</td></tr>
+      </table>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">→ ToolRegistry</div>
+      <table class="iface-table">
+        <tr><th>调用</th><th>参数</th><th>返回</th></tr>
+        <tr><td>registry.get(name)</td><td>"edit_file" / "bash" / "read_file"</td><td>&amp;dyn Tool</td></tr>
+        <tr><td>tool.execute(ctx)</td><td>ToolContext (cwd=worktree)</td><td>ToolResult</td></tr>
+      </table>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">→ LlmProvider</div>
+      <table class="iface-table">
+        <tr><th>调用</th><th>参数</th><th>返回</th></tr>
+        <tr><td>provider.chat(request)</td><td>ChatRequest (model, messages, tools)</td><td>Stream&lt;Chunk&gt;</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="module">
+    <div class="module-title">
+      <span class="badge badge-core">AGENT</span>
+      OrchestratorAgent
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">字段</div>
+      <pre><code>id  (无 branch / worktree)
+conversation: Conversation
+runner: TurnRunner
+state: Arc&lt;RwLock&lt;AgentState&gt;&gt;
+event_rx: Receiver&lt;AgentEvent&gt;     // 所有事件
+control_rx: Receiver&lt;AgentCommand&gt;
+resources: ResourceHandle             // 用于 spawn
+policy: Arc&lt;RwLock&lt;Policy&gt;&gt;</code></pre>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">元工具（注入 LLM 的工具集）</div>
+      <table class="iface-table">
+        <tr><th>工具名</th><th>参数</th><th>返回</th><th>说明</th></tr>
+        <tr><td>inspect_agent</td><td>agent_id: u64</td><td>AgentSnapshot</td><td>查看 Agent 状态</td></tr>
+        <tr><td>spawn_execution</td><td>task: String, files: Vec&lt;String&gt;</td><td>AgentId</td><td>创建执行 Agent</td></tr>
+        <tr><td>kill_agent</td><td>agent_id: u64, reason: String</td><td>bool</td><td>终止 Agent</td></tr>
+        <tr><td>promote_branch</td><td>agent_id: u64, to: String</td><td>bool</td><td>合并分支</td></tr>
+        <tr><td>declare_complete</td><td>summary: String</td><td>—</td><td>宣布任务完成</td></tr>
+      </table>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">→ ResourceManager</div>
+      <table class="iface-table">
+        <tr><th>调用</th><th>参数</th><th>返回</th></tr>
+        <tr><td>resources.spawn()</td><td>AgentKind::Execution, AgentSpec</td><td>AgentId</td></tr>
+        <tr><td>resources.send_command()</td><td>AgentId, AgentCommand::Kill</td><td>Result&lt;()&gt;</td></tr>
+        <tr><td>resources.snapshot(id)</td><td>AgentId</td><td>Option&lt;AgentSnapshot&gt;</td></tr>
+        <tr><td>resources.snapshots()</td><td>—</td><td>Vec&lt;AgentSnapshot&gt;</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="module">
+    <div class="module-title">
+      <span class="badge badge-core">AGENT</span>
+      ReviewerAgent
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">字段</div>
+      <pre><code>id, branch, worktree
+conversation: Conversation
+runner: TurnRunner
+tool_ctx: ToolContext
+tool_reg: ToolRegistry  // diff + test tools
+state, event_tx, control_rx</code></pre>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">工具集</div>
+      <table class="iface-table">
+        <tr><th>工具</th><th>说明</th></tr>
+        <tr><td>git_diff</td><td>查看分支 diff</td></tr>
+        <tr><td>run_tests</td><td>运行测试套件</td></tr>
+        <tr><td>read_file</td><td>范围限定读取</td></tr>
+      </table>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">输出</div>
+      <table class="iface-table">
+        <tr><th>Event</th><th>Payload</th></tr>
+        <tr><td>ReviewResult</td><td>score: f64, verdict: String</td></tr>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<div class="layer-label">▸ 模块 E：工具与 Provider</div>
+<div class="grid grid-2">
+
+  <div class="module">
+    <div class="module-title">
+      <span class="badge badge-core">CRATE</span>
+      hydra-core / tools/
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">Tool trait</div>
+      <pre><code>#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -&gt; &str;
+    fn schema(&self) -&gt; ToolSchema;           // JSON Schema
+    async fn execute(&self, ctx: &ToolContext, args: Value) -&gt; ToolResult;
+}</code></pre>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">内置工具</div>
+      <table class="iface-table">
+        <tr><th>工具</th><th>关键参数</th><th>返回</th></tr>
+        <tr><td>edit_file</td><td>path: PathBuf, content: String, diff: bool</td><td>ToolResult</td></tr>
+        <tr><td>read_file</td><td>path: PathBuf, offset?: usize, limit?: usize</td><td>ToolResult</td></tr>
+        <tr><td>bash</td><td>cmd: String, cwd: PathBuf, timeout?: u64</td><td>ToolResult (stdout/stderr)</td></tr>
+        <tr><td>git_diff</td><td>base: String, head: String</td><td>ToolResult (diff text)</td></tr>
+        <tr><td>glob</td><td>pattern: String</td><td>ToolResult (paths)</td></tr>
+        <tr><td>grep</td><td>pattern: String, path: PathBuf</td><td>ToolResult (matches)</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="module">
+    <div class="module-title">
+      <span class="badge badge-core">CRATE</span>
+      hydra-core / provider/
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">LlmProvider trait</div>
+      <pre><code>#[async_trait]
+pub trait LlmProvider: Send + Sync {
+    fn name(&self) -&gt; &str;                    // "openai" / "anthropic"
+    async fn chat(&self, req: ChatRequest) -&gt; Result&lt;Stream&lt;Chunk&gt;&gt;;
+    async fn models(&self) -&gt; Result&lt;Vec&lt;Model&gt;&gt;;
+    fn supports_tools(&self) -&gt; bool;
+    fn max_context(&self) -&gt; usize;
+}</code></pre>
+    </div>
+    <div class="sub-module">
+      <div class="sub-title">ChatRequest 参数</div>
+      <table class="iface-table">
+        <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+        <tr><td>model</td><td>String</td><td>模型名 "gpt-4o" / "claude-sonnet-4"</td></tr>
+        <tr><td>messages</td><td>Vec&lt;Message&gt;</td><td>对话历史</td></tr>
+        <tr><td>tools</td><td>Option&lt;Vec&lt;ToolDef&gt;&gt;</td><td>可用工具定义</td></tr>
+        <tr><td>temperature</td><td>Option&lt;f32&gt;</td><td>采样温度</td></tr>
+        <tr><td>max_tokens</td><td>Option&lt;u32&gt;</td><td>最大输出 token</td></tr>
+        <tr><td>stream</td><td>bool</td><td>是否流式</td></tr>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<div class="layer-label">▸ 模块 F：Git 适配层</div>
+<div class="module">
+  <div class="module-title">
+    <span class="badge badge-core">CRATE</span>
+    hydra-core / git.rs → hydra-workspace
+  </div>
+  <div class="sub-module">
+    <div class="sub-title">职责：将 Hydra 类型映射到 ISO-Framework 类型</div>
+    <table class="iface-table">
+      <tr><th>Hydra 类型</th><th>映射到</th><th>ISO-Framework 类型</th></tr>
+      <tr><td>AgentId</td><td>→</td><td>分支名 format!("agent/{}", id.0)</td></tr>
+      <tr><td>AgentSpec</td><td>→</td><td>CreateOptions { branch, path, base }</td></tr>
+      <tr><td>AgentOutcome</td><td>→</td><td>决定 delete / retain / promote</td></tr>
+      <tr><td>AgentCommand::Kill</td><td>→</td><td>DeleteOptions { force: false }</td></tr>
+    </table>
+  </div>
+  <div class="sub-module">
+    <div class="sub-title">→ hydra-workspace 的接口</div>
+    <table class="iface-table">
+      <tr><th>调用</th><th>参数</th><th>返回</th></tr>
+      <tr><td>HydraWorkspaceManager::new()</td><td>repo_path: PathBuf</td><td>Self</td></tr>
+      <tr><td>.create_for_agent()</td><td>AgentId, base_branch: &str</td><td>Result&lt;PathBuf&gt;</td></tr>
+      <tr><td>.cleanup_agent()</td><td>AgentId, &AgentOutcome</td><td>Result&lt;()&gt;</td></tr>
+      <tr><td>.gc()</td><td>—</td><td>Result&lt;GcReport&gt;</td></tr>
+    </table>
+  </div>
+</div>
+
+<hr class="divider"/>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!--  COMMUNICATION FLOW SUMMARY                                    -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2>通信流汇总 (Communication Flow Summary)</h2>
+
+<div class="module">
+  <div class="sub-title">完整调用链：用户提交任务 → Agent 完成 → 分支合并</div>
+  <pre><code><span class="text-gray">// 1. 用户通过 CLI 提交任务</span>
+hydra run "添加用户注册接口"
+  │
+  ▼
+<span class="text-gray">// 2. CLI 调用 ResourceManager</span>
+ResourceManager::spawn(AgentKind::Orchestrator, spec)
+  │
+  ▼
+<span class="text-gray">// 3. OrchestratorAgent.run() 启动，收到 SubmitTask 指令</span>
+OrchestratorAgent.on_command(AgentCommand::SubmitTask { description })
+  │
+  ▼  内部调用
+<span class="text-gray">// 4. Orchestrator 解析任务，生成 ExecutionAgent</span>
+resources.spawn(AgentKind::Execution, AgentSpec { files: ["src/auth.rs"], model: "claude" })
+  │
+  ▼
+<span class="text-gray">// 5. ResourceManager 调用 hydra-workspace 创建 worktree</span>
+HydraWorkspaceManager::create_for_agent(id, "main")
+  │  内部调用
+  ▼
+<span class="text-gray">// 6. ISO-Framework Manager::create() 执行</span>
+iso_code::Manager::create(branch, path, options)
+  │  返回
+  ▼
+<span class="text-gray">// 7. ResourceManager 创建 ExecutionAgent，spawn 异步任务</span>
+tokio::spawn(agent.run(resources))
+  │
+  ▼
+<span class="text-gray">// 8. ExecutionAgent 内部循环：LLM + Tool</span>
+loop {
+    response = provider.chat(chat_request)      // ← hydra LlmProvider
+    tool_calls = parse_tool_calls(response)
+    for call in tool_calls {
+        tool = tool_registry.get(call.name)     // ← hydra-core ToolRegistry
+        result = tool.execute(tool_ctx, args)   // ← cwd = worktree
+        event_tx.send(AgentEvent::ToolCall)     // ← 发送事件
+    }
+}
+  │
+  ▼  事件流
+<span class="text-gray">// 9. EventBus 扇出到所有订阅者</span>
+EventBus::broadcast(AgentEvent::ToolCall)
+  ├─▶ OrchestratorAgent.event_rx
+  ├─▶ hydra-daemon (REST → VSCode / Web)
+  ├─▶ hydra-cli TUI
+  └─▶ 其他订阅者
+  │
+  ▼  决策
+<span class="text-gray">// 10. Orchestrator 评估质量，决定 promote</span>
+OrchestratorAgent 内部 LLM 决策
+  → resources.send_command(id, AgentCommand::Kill)   // 对其他 Agent
+  → resources.send_command(id, AgentCommand::InjectHint)  // 注入提示
+  │
+  ▼
+<span class="text-gray">// 11. ExecutionAgent 完成，发出 Completed 事件</span>
+event_tx.send(AgentEvent::Completed { agent_id, outcome })
+  │
+  ▼
+<span class="text-gray">// 12. Orchestrator 决定 promote，调用 git merge</span>
+HydraWorkspaceManager::cleanup_agent(id, outcome)  // 保留分支
+  │
+  ▼
+<span class="text-gray">// 13. 用户通过 hydra promote 合并到 main</span>
+hydra promote 1 --to main
+  │
+  ▼
+<span class="text-gray">// 14. CLI 调用 ResourceManager</span>
+ResourceManager::send_command(1, AgentCommand::ReviewTarget { ... })</code></pre>
+  </div>
+</div>
+
+<hr class="divider"/>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!--  INTERFACE MATRIX                                             -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2>接口矩阵总表 (Interface Matrix)</h2>
+
+<div class="module">
+  <table class="iface-table" style="width:100%">
+    <tr>
+      <th style="min-width:140px">调用方</th>
+      <th style="min-width:160px">接口</th>
+      <th style="min-width:140px">接收方</th>
+      <th>关键参数</th>
+      <th>返回</th>
+    </tr>
+    <tr>
+      <td>hydra-cli</td>
+      <td>ResourceManager::spawn()</td>
+      <td class="text-blue">hydra-core / resource.rs</td>
+      <td>AgentKind, AgentSpec</td>
+      <td class="text-green">AgentHandle</td>
+    </tr>
+    <tr>
+      <td>hydra-cli</td>
+      <td>ResourceManager::send_command()</td>
+      <td class="text-blue">hydra-core / resource.rs</td>
+      <td>AgentId, AgentCommand</td>
+      <td class="text-green">Result&lt;()&gt;</td>
+    </tr>
+    <tr>
+      <td>hydra-daemon</td>
+      <td>ResourceManager::subscribe()</td>
+      <td class="text-blue">hydra-core / resource.rs</td>
+      <td>—</td>
+      <td class="text-green">Receiver&lt;AgentEvent&gt;</td>
+    </tr>
+    <tr>
+      <td>hydra-daemon</td>
+      <td>ResourceManager::snapshots()</td>
+      <td class="text-blue">hydra-core / resource.rs</td>
+      <td>—</td>
+      <td class="text-green">Vec&lt;AgentSnapshot&gt;</td>
+    </tr>
+    <tr>
+      <td class="text-pink">OrchestratorAgent</td>
+      <td>ResourceManager::spawn()</td>
+      <td class="text-blue">hydra-core / resource.rs</td>
+      <td>AgentKind::Execution, AgentSpec</td>
+      <td class="text-green">AgentId</td>
+    </tr>
+    <tr>
+      <td class="text-pink">OrchestratorAgent</td>
+      <td>ResourceManager::send_command()</td>
+      <td class="text-blue">hydra-core / resource.rs</td>
+      <td>AgentId, AgentCommand::Kill</td>
+      <td class="text-green">Result&lt;()&gt;</td>
+    </tr>
+    <tr>
+      <td class="text-pink">OrchestratorAgent</td>
+      <td>ResourceManager::snapshot(id)</td>
+      <td class="text-blue">hydra-core / resource.rs</td>
+      <td>AgentId</td>
+      <td class="text-green">Option&lt;AgentSnapshot&gt;</td>
+    </tr>
+    <tr>
+      <td class="text-green">ExecutionAgent</td>
+      <td>event_tx.send()</td>
+      <td class="text-blue">hydra-core / resource.rs</td>
+      <td>AgentEvent</td>
+      <td class="text-green">()</td>
+    </tr>
+    <tr>
+      <td class="text-green">ExecutionAgent</td>
+      <td>ToolRegistry::get()</td>
+      <td class="text-orange">hydra-core / tools/</td>
+      <td>"edit_file" / "bash" / "read_file"</td>
+      <td class="text-green">&amp;dyn Tool</td>
+    </tr>
+    <tr>
+      <td class="text-green">ExecutionAgent</td>
+      <td>Tool::execute()</td>
+      <td class="text-orange">hydra-core / tools/</td>
+      <td>ToolContext, args: Value</td>
+      <td class="text-green">ToolResult</td>
+    </tr>
+    <tr>
+      <td class="text-green">ExecutionAgent</td>
+      <td>LlmProvider::chat()</td>
+      <td class="text-purple">hydra / provider.rs</td>
+      <td>ChatRequest { model, messages, tools }</td>
+      <td class="text-green">Stream&lt;Chunk&gt;</td>
+    </tr>
+    <tr>
+      <td class="text-blue">hydra-core / git.rs</td>
+      <td>HydraWorkspaceManager::create_for_agent()</td>
+      <td class="text-yellow">hydra-workspace</td>
+      <td>AgentId, base_branch</td>
+      <td class="text-green">Result&lt;PathBuf&gt;</td>
+    </tr>
+    <tr>
+      <td class="text-blue">hydra-core / git.rs</td>
+      <td>HydraWorkspaceManager::cleanup_agent()</td>
+      <td class="text-yellow">hydra-workspace</td>
+      <td>AgentId, AgentOutcome</td>
+      <td class="text-green">Result&lt;()&gt;</td>
+    </tr>
+    <tr>
+      <td class="text-yellow">hydra-workspace</td>
+      <td>iso_code::Manager::create()</td>
+      <td class="text-gray">iso-code (ISO-Framework)</td>
+      <td>branch, path, CreateOptions</td>
+      <td class="text-green">(Handle, Info)</td>
+    </tr>
+    <tr>
+      <td class="text-yellow">hydra-workspace</td>
+      <td>iso_code::Manager::delete()</td>
+      <td class="text-gray">iso-code (ISO-Framework)</td>
+      <td>Handle, DeleteOptions</td>
+      <td class="text-green">Result&lt;()&gt;</td>
+    </tr>
+    <tr>
+      <td>VSCode Extension</td>
+      <td>POST /api/v1/agents/:id/open</td>
+      <td class="text-blue">hydra-daemon</td>
+      <td>{agent_id}</td>
+      <td class="text-green">{worktree_path}</td>
+    </tr>
+    <tr>
+      <td>Web Dashboard</td>
+      <td>WebSocket subscribe</td>
+      <td class="text-blue">hydra-daemon</td>
+      <td>{"action":"subscribe"}</td>
+      <td class="text-green">AgentEvent stream</td>
+    </tr>
+  </table>
+</div>
+
+<hr class="divider"/>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!--  DEPENDENCY DIRECTION                                         -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2>依赖方向 (Dependency Direction)</h2>
+
+<div class="module">
+  <pre><code><span class="text-gray">// 上层依赖下层，下层不知道上层的存在</span>
+
+hydra-cli ─────────────────────────┐
+hydra-daemon ──────────────────────┤
+extensions/vscode ────────────────┤
+dashboard ────────────────────────┤
+                                  ▼
+                          ┌───────────────┐
+                          │  hydra-core   │  ← 核心，无上层依赖
+                          └───────┬───────┘
+                                  │
+                    ┌─────────────┼─────────────┐
+                    │             │             │
+                    ▼             ▼             ▼
+              hydra-workspace   provider/     tools/
+              (ISO-Framework    (OpenAI/      (edit/bash/
+               fork)            Anthropic/    read/...)
+                                Ollama)
+
+<span class="text-gray">// hydra-core 只依赖：
+//   - hydra-workspace（worktree 操作）
+//   - hydra-core（LLM / Tool 基础 trait）
+//   - 标准库 + tokio + serde</span>
+
+<span class="text-gray">// 禁止的依赖（违反架构）：</span>
+<span class="text-pink">//   ❌ hydra-core → hydra-daemon（core 不知道 daemon）</span>
+<span class="text-pink">//   ❌ hydra-core → hydra-cli（core 不知道 CLI）</span>
+<span class="text-pink">//   ❌ hydra-workspace → hydra-core（workspace 不知道 Agent）</span>
+<span class="text-pink">//   ❌ Agent 直接持有另一个 Agent 的引用（通过 EventBus 通信）</span></code></pre>
+</div>
+
+<hr class="divider"/>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!--  DATA FLOW DIAGRAM                                            -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<h2>运行时数据流 (Runtime Data Flow)</h2>
+
+<div class="module">
+  <pre><code><span class="text-gray">// 每个 ExecutionAgent 的运行时数据流：</span>
+
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────────┐
+│  LLM API    │────▶│  TurnRunner  │────▶│  ToolRegistry│────▶│  ToolContext  │
+│  (OpenAI/   │     │  (对话循环)   │     │  (工具调度)   │     │  (cwd=wt)    │
+│   Claude)   │     └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+└─────────────┘            │                     │                     │
+                           │  response           │  execute()          │  file ops
+                           ▼                     ▼                     ▼
+                    ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+                    │  parse tool  │     │  Tool::exec  │     │  .worktrees/  │
+                    │  _calls()    │     │  (edit/bash) │     │  wt-N/        │
+                    └──────┬───────┘     └──────┬───────┘     └──────────────┘
+                           │                     │
+                           │  AgentEvent         │  ToolResult
+                           ▼                     ▼
+                    ┌──────────────┐     ┌──────────────┐
+                    │  event_tx    │────▶│  更新 state  │
+                    │  .send()     │     │  (Arc&lt;RwLock&gt;)│
+                    └──────────────┘     └──────────────┘
+                           │
+                           ▼  fan-out
+                    ┌──────────────┐
+                    │   EventBus   │──▶ Orchestrator / Daemon / TUI
+                    └──────────────┘</code></pre>
+</div>
+
+<div style="margin-top: 40px; padding: 16px; background: #1f2937; border-radius: 8px; font-size: 12px; color: #9ca3af;">
+  <strong>文件位置：</strong><code>docs/architecture/module-architecture.html</code><br>
+  <strong>渲染方式：</strong>直接在浏览器打开，或嵌入到文档站点<br>
+  <strong>更新方式：</strong>接口变更时同步修改 HTML 中的表格 + 接口矩阵
+</div>
+
+</body>
+</html>

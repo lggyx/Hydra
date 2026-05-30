@@ -1,0 +1,681 @@
+// crates/hydra-tuix/src/modals/provider_wizard.rs
+//
+// `/provider` modal — multi-step Q&A wizard for provider management.
+//
+// Runs entirely in scrollback (no alt-screen): each step pushes a prompt
+// line ("Provider name?"), the user types + Enter, the answer is echoed
+// back and the next step's prompt appears. Persistent menus (MainMenu,
+// EditPick, DeletePick, SetDefaultPick) reuse the `MenuPayload` footer
+// palette. Esc cancels at any point.
+
+use anyhow::Result;
+use hydra_core::config::provider::ProviderConfig;
+use crossterm::event::{KeyCode, KeyModifiers};
+
+use super::{Modal, ModalAction};
+use crate::event_loop::{build_status, save_and_reload, Buffer, LoopCtx};
+use crate::input::key_action::classify;
+use crate::render::{MenuPayload, Renderer, UiLine};
+use crate::state::UiState;
+
+pub enum ProviderWizard {
+    /// Initial picker: Add / Edit / Delete / Set Default.
+    MainMenu { selected: usize },
+    /// Sequential `Add` prompts. `draft` accumulates answered fields.
+    Add {
+        step: WizardStep,
+        draft: DraftProvider,
+    },
+    /// Pick which provider to edit.
+    EditPick {
+        providers: Vec<String>,
+        selected: usize,
+    },
+    /// Editing a specific provider; same flow as `Add` but prompts show
+    /// the existing value as a hint and an empty Enter keeps it.
+    Edit {
+        target: String,
+        step: WizardStep,
+        draft: DraftProvider,
+    },
+    /// Pick which provider to delete.
+    DeletePick {
+        providers: Vec<String>,
+        selected: usize,
+    },
+    /// Final y/N confirmation before a delete actually lands.
+    DeleteConfirm { target: String },
+    /// Pick which provider to make default.
+    SetDefaultPick {
+        providers: Vec<String>,
+        selected: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum WizardStep {
+    Name,
+    ProviderType,
+    BaseUrl,
+    ApiKey,
+    Model,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DraftProvider {
+    pub name: String,
+    pub provider_type: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl DraftProvider {
+    /// Merge this draft onto `base` — empty fields leave `base` untouched.
+    /// Used by Edit so an empty Enter at a prompt keeps the existing value.
+    fn apply_onto(&self, base: &mut ProviderConfig) {
+        if !self.provider_type.is_empty() {
+            base.provider_type = self.provider_type.clone();
+        }
+        if !self.base_url.is_empty() {
+            base.base_url = Some(self.base_url.clone());
+        }
+        if !self.api_key.is_empty() {
+            base.api_key = Some(self.api_key.clone());
+        }
+        if !self.model.is_empty() {
+            base.model = self.model.clone();
+        }
+    }
+
+    fn into_config(self) -> ProviderConfig {
+        use hydra_core::config::provider::default_context_window_for;
+        let provider_type = self.provider_type.clone();
+        ProviderConfig {
+            provider_type: provider_type.clone(),
+            api_key: if self.api_key.is_empty() {
+                None
+            } else {
+                Some(self.api_key)
+            },
+            model: self.model,
+            base_url: if self.base_url.is_empty() {
+                None
+            } else {
+                Some(self.base_url)
+            },
+            system_prompt: None,
+            user_agent: None,
+            context_window: default_context_window_for(&provider_type),
+            max_tokens: None,
+            thinking_type: None,
+            thinking_keep: None,
+            reasoning_history: None,
+            thinking_enabled: None,
+            thinking_budget: None,
+            skip_tls_verify: false,
+            ephemeral: false,
+
+}
+    }
+}
+
+impl Modal for ProviderWizard {
+    fn handle_key(
+        &mut self,
+        code: KeyCode,
+        mods: KeyModifiers,
+        buf: &mut Buffer,
+        state: &mut UiState,
+        ctx: &mut LoopCtx,
+        renderer: &mut dyn Renderer,
+    ) -> Result<ModalAction> {
+        handle_key(code, mods, buf, state, ctx, renderer, self)
+    }
+
+    fn draw(&self, buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+        redraw(buf, state, ctx, self, renderer);
+    }
+}
+
+/// Process one key for the wizard. Returns `Continue` if the wizard
+/// stays active, `Close` when it's done (cancelled, committed, or
+/// transitioned to Idle after a terminal operation).
+fn handle_key(
+    code: KeyCode,
+    _mods: KeyModifiers,
+    buf: &mut Buffer,
+    state: &mut UiState,
+    ctx: &mut LoopCtx,
+    renderer: &mut dyn Renderer,
+    wizard: &mut ProviderWizard,
+) -> Result<ModalAction> {
+    // Esc always cancels at any point.
+    if matches!(code, KeyCode::Esc) {
+        buf.text.clear();
+        buf.cursor = 0;
+        push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderWizardCancelled));
+        return Ok(ModalAction::Close);
+    }
+
+    // Take the current state out so we can move fields; put it back
+    // (or replace it) before returning Continue.
+    let current = std::mem::replace(wizard, ProviderWizard::MainMenu { selected: 0 });
+    match current {
+        // ── Menu states: Up / Down / Enter navigate; others ignored. ──
+        ProviderWizard::MainMenu { mut selected } => {
+            const ITEMS: [&str; 4] = ["add", "edit", "delete", "set-default"];
+            match code {
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                    *wizard = ProviderWizard::MainMenu { selected };
+                }
+                KeyCode::Down => {
+                    if selected + 1 < ITEMS.len() {
+                        selected += 1;
+                    }
+                    *wizard = ProviderWizard::MainMenu { selected };
+                }
+                KeyCode::Enter => {
+                    let providers: Vec<String> = {
+                        let mut v: Vec<String> = ctx.config.providers.keys().cloned().collect();
+                        v.sort();
+                        v
+                    };
+                    match ITEMS[selected] {
+                        "add" => {
+                            let new = ProviderWizard::Add {
+                                step: WizardStep::Name,
+                                draft: DraftProvider::default(),
+                            };
+                            show_step_prompt(
+                                WizardStep::Name,
+                                None,
+                                buf,
+                                state,
+                                ctx,
+                                &new,
+                                renderer,
+                            );
+                            *wizard = new;
+                        }
+                        "edit" | "delete" | "set-default" if providers.is_empty() => {
+                            push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderNoProviders));
+                            return Ok(ModalAction::Close);
+                        }
+                        "edit" => {
+                            let new = ProviderWizard::EditPick {
+                                providers,
+                                selected: 0,
+                            };
+                            redraw(buf, state, ctx, &new, renderer);
+                            *wizard = new;
+                        }
+                        "delete" => {
+                            let new = ProviderWizard::DeletePick {
+                                providers,
+                                selected: 0,
+                            };
+                            redraw(buf, state, ctx, &new, renderer);
+                            *wizard = new;
+                        }
+                        "set-default" => {
+                            let new = ProviderWizard::SetDefaultPick {
+                                providers,
+                                selected: 0,
+                            };
+                            redraw(buf, state, ctx, &new, renderer);
+                            *wizard = new;
+                        }
+                        _ => {
+                            *wizard = ProviderWizard::MainMenu { selected };
+                        }
+                    }
+                }
+                _ => {
+                    *wizard = ProviderWizard::MainMenu { selected };
+                }
+            }
+            redraw(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
+        }
+
+        // ── Picker states share Up/Down/Enter logic. ──
+        ProviderWizard::EditPick {
+            providers,
+            mut selected,
+        } => {
+            match code {
+                KeyCode::Up => selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    if selected + 1 < providers.len() {
+                        selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let target = providers[selected].clone();
+                    let existing = ctx.config.providers.get(&target).cloned();
+                    let new = ProviderWizard::Edit {
+                        target: target.clone(),
+                        step: WizardStep::ProviderType, // skip Name (immutable)
+                        draft: DraftProvider::default(),
+                    };
+                    show_step_prompt(
+                        WizardStep::ProviderType,
+                        existing.as_ref(),
+                        buf,
+                        state,
+                        ctx,
+                        &new,
+                        renderer,
+                    );
+                    *wizard = new;
+                    return Ok(ModalAction::Continue);
+                }
+                _ => {}
+            }
+            *wizard = ProviderWizard::EditPick {
+                providers,
+                selected,
+            };
+            redraw(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
+        }
+
+        ProviderWizard::DeletePick {
+            providers,
+            mut selected,
+        } => {
+            match code {
+                KeyCode::Up => selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    if selected + 1 < providers.len() {
+                        selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let target = providers[selected].clone();
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleteConfirm { name: &target }));
+                    *wizard = ProviderWizard::DeleteConfirm { target };
+                    redraw(buf, state, ctx, wizard, renderer);
+                    return Ok(ModalAction::Continue);
+                }
+                _ => {}
+            }
+            *wizard = ProviderWizard::DeletePick {
+                providers,
+                selected,
+            };
+            redraw(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
+        }
+
+        ProviderWizard::SetDefaultPick {
+            providers,
+            mut selected,
+        } => {
+            match code {
+                KeyCode::Up => selected = selected.saturating_sub(1),
+                KeyCode::Down => {
+                    if selected + 1 < providers.len() {
+                        selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let chosen = providers[selected].clone();
+                    ctx.config.default_provider = chosen.clone();
+                    if let Some(p) = ctx.config.providers.get(&chosen) {
+                        ctx.model_name = p.model.clone();
+                    }
+                    save_and_reload(ctx, renderer);
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDefaultSet { name: &chosen }));
+                    return Ok(ModalAction::Close);
+                }
+                _ => {}
+            }
+            *wizard = ProviderWizard::SetDefaultPick {
+                providers,
+                selected,
+            };
+            redraw(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
+        }
+
+        ProviderWizard::DeleteConfirm { target } => {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    ctx.config.providers.remove(&target);
+                    // If we just dropped the default, fall back to any
+                    // remaining provider or blank.
+                    if ctx.config.default_provider == target {
+                        ctx.config.default_provider = ctx
+                            .config
+                            .providers
+                            .keys()
+                            .next()
+                            .cloned()
+                            .unwrap_or_default();
+                    }
+                    save_and_reload(ctx, renderer);
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleted { name: &target }));
+                }
+                _ => {
+                    push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderDeleteKept));
+                }
+            }
+            Ok(ModalAction::Close)
+        }
+
+        // ── Text-input states: Enter submits, chars edit buf, others pass through Buffer. ──
+        ProviderWizard::Add { step, mut draft } => {
+            if matches!(code, KeyCode::Enter) {
+                let answer = buf.text.clone();
+                push(renderer, &format!("  ↳ {}", answer));
+                buf.text.clear();
+                buf.cursor = 0;
+                match advance_add(&mut draft, step, &answer, renderer) {
+                    Some(next) => {
+                        let new = ProviderWizard::Add { step: next, draft };
+                        show_step_prompt(next, None, buf, state, ctx, &new, renderer);
+                        *wizard = new;
+                        return Ok(ModalAction::Continue);
+                    }
+                    None => {
+                        // All fields gathered — commit and switch to it.
+                        // Users expect /provider add to behave like "create
+                        // and activate": after the wizard closes, the newly
+                        // added entry should be the current default so the
+                        // next message uses it without an extra /model step.
+                        let name = draft.name.clone();
+                        let model = draft.model.clone();
+                        let cfg = draft.into_config();
+                        ctx.config.providers.insert(name.clone(), cfg);
+                        ctx.config.default_provider = name.clone();
+                        ctx.model_name = model.clone();
+                        save_and_reload(ctx, renderer);
+                        push(
+                            renderer,
+                            &crate::i18n::t(crate::i18n::Msg::ProviderAdded { name: &name, model: &model }),
+                        );
+                        return Ok(ModalAction::Close);
+                    }
+                }
+            }
+            // Forward other keys to the buffer so typing / editing works.
+            forward_to_buffer(code, _mods, buf, state, ctx);
+            *wizard = ProviderWizard::Add { step, draft };
+            redraw(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
+        }
+
+        ProviderWizard::Edit {
+            target,
+            step,
+            mut draft,
+        } => {
+            if matches!(code, KeyCode::Enter) {
+                let answer = buf.text.clone();
+                push(
+                    renderer,
+                    &format!(
+                        "  ↳ {}",
+                        if answer.is_empty() {
+                            crate::i18n::t(crate::i18n::Msg::ProviderEditKeep).into_owned()
+                        } else {
+                            answer.clone()
+                        }
+                    ),
+                );
+                buf.text.clear();
+                buf.cursor = 0;
+                match advance_edit(&mut draft, step, &answer, renderer) {
+                    Some(next) => {
+                        let existing = ctx.config.providers.get(&target).cloned();
+                        let new = ProviderWizard::Edit {
+                            target: target.clone(),
+                            step: next,
+                            draft,
+                        };
+                        show_step_prompt(next, existing.as_ref(), buf, state, ctx, &new, renderer);
+                        *wizard = new;
+                        return Ok(ModalAction::Continue);
+                    }
+                    None => {
+                        // Commit edit: merge draft onto existing provider.
+                        if let Some(existing) = ctx.config.providers.get_mut(&target) {
+                            draft.apply_onto(existing);
+                        }
+                        save_and_reload(ctx, renderer);
+                        push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUpdated { name: &target }));
+                        return Ok(ModalAction::Close);
+                    }
+                }
+            }
+            forward_to_buffer(code, _mods, buf, state, ctx);
+            *wizard = ProviderWizard::Edit {
+                target,
+                step,
+                draft,
+            };
+            redraw(buf, state, ctx, wizard, renderer);
+            Ok(ModalAction::Continue)
+        }
+    }
+}
+
+/// Redraw the footer with the wizard's current menu/prompt. Text-input
+/// steps show the normal input box; picker steps show an overlay menu
+/// built from wizard state.
+fn redraw(
+    buf: &Buffer,
+    state: &UiState,
+    ctx: &LoopCtx,
+    wizard: &ProviderWizard,
+    renderer: &mut dyn Renderer,
+) {
+    let menu = match wizard {
+        ProviderWizard::MainMenu { selected } => Some(MenuPayload {
+            items: vec![
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuAdd).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuAddDesc).into_owned()),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuEdit).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuEditDesc).into_owned()),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuDelete).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuDeleteDesc).into_owned()),
+                (crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefault).into_owned(),
+                 crate::i18n::t(crate::i18n::Msg::ProviderMenuSetDefaultDesc).into_owned()),
+            ],
+            selected: *selected,
+            kind: crate::render::MenuKind::SlashCommand,
+        }),
+        ProviderWizard::EditPick {
+            providers,
+            selected,
+        }
+        | ProviderWizard::DeletePick {
+            providers,
+            selected,
+        }
+        | ProviderWizard::SetDefaultPick {
+            providers,
+            selected,
+        } => {
+            let items: Vec<(String, String)> = providers
+                .iter()
+                .map(|name| {
+                    let desc = ctx
+                        .config
+                        .providers
+                        .get(name)
+                        .map(|c| format!("{} · {}", c.provider_type, c.model))
+                        .unwrap_or_default();
+                    (name.clone(), desc)
+                })
+                .collect();
+            Some(MenuPayload {
+                items,
+                selected: *selected,
+            kind: crate::render::MenuKind::SlashCommand,
+            })
+        }
+        // Q&A steps: plain input box, no overlay menu.
+        ProviderWizard::Add { .. }
+        | ProviderWizard::Edit { .. }
+        | ProviderWizard::DeleteConfirm { .. } => None,
+    };
+    renderer.render(UiLine::InputPrompt {
+        buf: buf.text.clone(),
+        cursor_byte: buf.cursor,
+        menu,
+        status: build_status(state, ctx),
+        attachments: Vec::new(),
+    });
+    renderer.flush();
+}
+
+/// Push a prompt line into scrollback. Steps share the same "tool-line"
+/// styling — a muted line with two-space indent — so the Q&A reads like
+/// the rest of the conversation rather than a modal popup.
+fn push(renderer: &mut dyn Renderer, text: &str) {
+    renderer.render(UiLine::CommandOutput(format!("  {}\n", text)));
+    renderer.flush();
+}
+
+/// Prompt string for the given wizard step; includes the existing value
+/// as a hint in Edit mode so the user sees what empty-Enter will keep.
+fn step_prompt_text(step: WizardStep, existing: Option<&ProviderConfig>) -> String {
+    use crate::i18n::{t, Msg};
+    match (step, existing) {
+        (WizardStep::Name, _) => t(Msg::ProviderStepName).into_owned(),
+        (WizardStep::ProviderType, None) => t(Msg::ProviderStepType).into_owned(),
+        (WizardStep::ProviderType, Some(p)) => {
+            t(Msg::ProviderStepTypeWithHint { current: &p.provider_type }).into_owned()
+        }
+        (WizardStep::BaseUrl, None) => t(Msg::ProviderStepBaseUrl).into_owned(),
+        (WizardStep::BaseUrl, Some(p)) => {
+            let default_hint = t(Msg::ProviderDefaultHint);
+            let hint = p.base_url.as_deref().unwrap_or(&default_hint);
+            t(Msg::ProviderStepBaseUrlWithHint { current: hint }).into_owned()
+        }
+        (WizardStep::ApiKey, None) => t(Msg::ProviderStepApiKey).into_owned(),
+        (WizardStep::ApiKey, Some(p)) => {
+            let hint = if p.api_key.is_some() {
+                t(Msg::ProviderStepApiKeySet)
+            } else {
+                t(Msg::ProviderStepApiKeyUnset)
+            };
+            t(Msg::ProviderStepApiKeyWithHint { hint: &hint }).into_owned()
+        }
+        (WizardStep::Model, None) => t(Msg::ProviderStepModel).into_owned(),
+        (WizardStep::Model, Some(p)) =>
+            t(Msg::ProviderStepModelWithHint { current: &p.model }).into_owned(),
+    }
+}
+
+/// Push the prompt for this step into scrollback + redraw footer.
+fn show_step_prompt(
+    step: WizardStep,
+    existing: Option<&ProviderConfig>,
+    buf: &Buffer,
+    state: &UiState,
+    ctx: &LoopCtx,
+    wizard: &ProviderWizard,
+    renderer: &mut dyn Renderer,
+) {
+    push(renderer, &step_prompt_text(step, existing));
+    redraw(buf, state, ctx, wizard, renderer);
+}
+
+/// Validate and advance the "Add" sub-flow. Returns the next state, or
+/// None when the wizard has committed / cancelled (caller clears).
+fn advance_add(
+    draft: &mut DraftProvider,
+    step: WizardStep,
+    answer: &str,
+    renderer: &mut dyn Renderer,
+) -> Option<WizardStep> {
+    let ans = answer.trim();
+    match step {
+        WizardStep::Name => {
+            if ans.is_empty() {
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderNameEmpty));
+                return Some(WizardStep::Name);
+            }
+            draft.name = ans.to_string();
+            Some(WizardStep::ProviderType)
+        }
+        WizardStep::ProviderType => {
+            if !["openai", "claude", "ollama"].contains(&ans) {
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderUnknownType));
+                return Some(WizardStep::ProviderType);
+            }
+            draft.provider_type = ans.to_string();
+            Some(WizardStep::BaseUrl)
+        }
+        WizardStep::BaseUrl => {
+            draft.base_url = ans.to_string();
+            Some(WizardStep::ApiKey)
+        }
+        WizardStep::ApiKey => {
+            draft.api_key = ans.to_string();
+            Some(WizardStep::Model)
+        }
+        WizardStep::Model => {
+            if ans.is_empty() {
+                push(renderer, &crate::i18n::t(crate::i18n::Msg::ProviderModelEmpty));
+                return Some(WizardStep::Model);
+            }
+            draft.model = ans.to_string();
+            None // signal: ready to commit
+        }
+    }
+}
+
+/// Validate and advance the "Edit" sub-flow. Empty answers preserve
+/// the existing value, so the caller needs `existing` to know what
+/// that value is.
+fn advance_edit(
+    draft: &mut DraftProvider,
+    step: WizardStep,
+    answer: &str,
+    renderer: &mut dyn Renderer,
+) -> Option<WizardStep> {
+    let ans = answer.trim();
+    match step {
+        WizardStep::Name => {
+            // Name isn't editable (it's the key into the provider map).
+            Some(WizardStep::ProviderType)
+        }
+        WizardStep::ProviderType => {
+            if !ans.is_empty() && !["openai", "claude", "ollama"].contains(&ans) {
+                push(
+                    renderer,
+                    &crate::i18n::t(crate::i18n::Msg::ProviderUnknownTypeEdit),
+                );
+                return Some(WizardStep::ProviderType);
+            }
+            draft.provider_type = ans.to_string();
+            Some(WizardStep::BaseUrl)
+        }
+        WizardStep::BaseUrl => {
+            draft.base_url = ans.to_string();
+            Some(WizardStep::ApiKey)
+        }
+        WizardStep::ApiKey => {
+            draft.api_key = ans.to_string();
+            Some(WizardStep::Model)
+        }
+        WizardStep::Model => {
+            draft.model = ans.to_string();
+            None
+        }
+    }
+}
+
+/// Route a keystroke into `Buffer::apply` so text-input wizard steps
+/// support the usual editing shortcuts (Backspace / Left / Right / etc).
+fn forward_to_buffer(code: KeyCode, modifiers: KeyModifiers, buf: &mut Buffer, state: &mut UiState, ctx: &LoopCtx) {
+    let action = classify(code, modifiers);
+    let _ = buf.apply(action, ctx.history.entries(), &ctx.commands);
+    crate::event_loop::sync_recalled_attachments(state, buf, ctx.history.entries());
+}

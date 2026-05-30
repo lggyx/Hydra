@@ -1,0 +1,46 @@
+
+running 22 tests
+test tests::auth_gap_catches_missing_refresh_token ... ok
+test tests::ascii_short_unchanged ... ok
+test tests::auth_gap_catches_refresh_network_failure ... ok
+test tests::auth_gap_does_not_swallow_non_auth_errors ... ok
+test tests::cjk_chunks_stream_correctly ... ok
+test tests::close_appends_newline_and_clears_open ... ok
+test tests::ascii_long_truncated_with_ellipsis ... ok
+test tests::auth_gap_catches_refresh_parse_failure ... ok
+test tests::embedded_newline_reprefixes_next_line ... ok
+test tests::cjk_truncation_does_not_panic ... ok
+test tests::auth_gap_catches_historical_three ... ok
+test tests::empty_chunk_is_noop ... ok
+test tests::auth_gap_catches_refresh_http_failure ... ok
+test tests::mixed_ascii_cjk_truncates_at_char_boundary ... ok
+test tests::newlines_become_spaces ... ok
+test tests::resolve_working_dir_falls_back_to_input_when_canonicalize_fails ... ok
+test tests::resolve_working_dir_uses_cwd_when_no_cli_dir ... ok
+test tests::resolve_working_dir_honors_cli_dir ... ok
+test tests::thinking_chunks_stream_onto_single_line ... ok
+test tests::thinking_followed_by_tool_call_is_separated ... ok
+test tests::trailing_newline_closes_and_next_chunk_reprefixes ... ok
+test tests::prompt_file_read_preserves_trailing_newline ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+test shell_script_matches_rust ... FAILED
+test powershell_script_matches_rust ... ok
+
+failures:
+
+---- shell_script_matches_rust stdout ----
+
+thread 'shell_script_matches_rust' (39168) panicked at crates\hydra-cli\tests\script_parity.rs:56:10:
+run uninstall.sh --print-manifest: Error { kind: NotFound, message: "program not found" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    shell_script_matches_rust
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+

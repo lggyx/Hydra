@@ -1,0 +1,30 @@
+FROM debian:bookworm-slim
+
+# Use China mirror for faster downloads
+RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
+
+# Install required utilities
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -r -s /bin/bash hydra
+
+WORKDIR /home/hydra
+
+# Copy pre-built Linux binaries from dist directory
+COPY dist/v*/hydra-daemon-*-linux-x64 /tmp/hydra-daemon
+
+# Install binaries
+RUN chmod +x /tmp/hydra-daemon && \
+    mv /tmp/hydra-daemon /usr/local/bin/hydra-daemon
+
+# Expose daemon port
+EXPOSE 13456
+
+WORKDIR /workspace
+
+# Start daemon only
+ENTRYPOINT ["hydra-daemon"]

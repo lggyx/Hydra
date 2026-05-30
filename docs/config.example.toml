@@ -1,0 +1,40 @@
+default_provider = "deepseek"
+ 
+[providers.deepseek]
+type = "openai"
+api_key = "sk-..."
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+context_window = 64000
+# Override the reasoning_content history-echo policy. Unset = auto-detect
+# from model name (deepseek-v4* → include, deepseek-reasoner/r1 → exclude,
+# kimi-* / moonshot → include, rest → exclude). Set explicitly when hitting
+# a 400 like "reasoning_content ... must be passed back to the API" or
+# "reasoning_content is missing in assistant tool call message".
+# reasoning_history = "include"  # or "exclude"
+
+# Per-turn datalog. Each turn writes a markdown summary; each LLM
+# round writes a JSON request/response pair under `<dir>/<project>/llm/`.
+# A per-project subdirectory is always appended under `dir` so multiple
+# projects never share a bucket.
+# - enabled = false        -> disable logging entirely
+# - dir = "~/.hydra/datalog" -> default (follows $HOME, ignores /cd)
+# - dir = "/abs/path"      -> absolute, fixed (unaffected by /cd)
+# - dir = "rel/path"       -> joined with current working_dir, follows /cd
+[datalog]
+enabled = true
+dir = "~/.hydra/datalog"
+
+# Long-running task completion notifications.
+# Strategy: terminal-native notifications first (kitty / WezTerm / iTerm2),
+# then OS-native fallback when available (macOS osascript, Linux notify-send).
+# Windows mainly relies on BEL + terminal attention/taskbar flash.
+# `background_only` is best-effort: focus-aware terminal protocols honor it,
+# while some OS fallbacks may still notify even if Hydra is focused.
+[notifications]
+enabled = true
+min_duration_secs = 8
+terminal = true
+system = true
+bell = true
+background_only = true
