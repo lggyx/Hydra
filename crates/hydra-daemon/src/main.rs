@@ -736,7 +736,7 @@ fn disabled_tools_from_env() -> std::collections::HashSet<String> {
         .unwrap_or_default()
 }
 
-fn daemon_tool_enabled(name: &str) -> bool {
+pub(crate) fn daemon_tool_enabled(name: &str) -> bool {
     let disabled_tools = disabled_tools_from_env();
     if disabled_tools.contains(name) {
         return false;
@@ -2362,7 +2362,7 @@ async fn process_chat_request(
 /// full rules). The only omission is plan mode (not applicable in API mode).
 ///
 /// This function is self-contained — it does NOT touch any TUI code path.
-fn build_api_system_prompt(
+pub(crate) fn build_api_system_prompt(
     working_dir: &PathBuf,
     _config: &Config,
     provider_config: &hydra_core::config::provider::ProviderConfig,
@@ -2875,20 +2875,21 @@ async fn main() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(now_unix_ms()));
     let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>> = Arc::new(RwLock::new(HashMap::new()));
     let state = AppState {
         sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         project: Arc::new(RwLock::new(project_state)),
         chat_tasks: Arc::new(RwLock::new(HashMap::new())),
         stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
         mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
-        mcp_cache: Arc::new(RwLock::new(HashMap::new())),
+        mcp_cache: mcp_cache.clone(),
         login_sessions: Arc::new(RwLock::new(HashMap::new())),
         telemetry: telemetry.clone(),
         repo_origin: repo_origin.clone(),
         shutdown_tx: shutdown_tx.clone(),
         last_activity: last_activity.clone(),
         active_connections: active_connections.clone(),
-        agent_registry: Arc::new(api_agent::AgentRegistry::new()),
+        agent_registry: Arc::new(api_agent::AgentRegistry::new(mcp_cache.clone())),
     };
 
     let app = Router::new()
@@ -3133,6 +3134,7 @@ mod tests {
 
     fn test_app_state(project_dir: PathBuf, telemetry_home: PathBuf) -> AppState {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>> = Arc::new(RwLock::new(HashMap::new()));
         AppState {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             project: Arc::new(RwLock::new(ProjectState {
@@ -3147,7 +3149,7 @@ mod tests {
             chat_tasks: Arc::new(RwLock::new(HashMap::new())),
             stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
             mcp_registry: Arc::new(RwLock::new(Arc::new(McpRegistry::new()))),
-            mcp_cache: Arc::new(RwLock::new(HashMap::new())),
+            mcp_cache: mcp_cache.clone(),
             login_sessions: Arc::new(RwLock::new(HashMap::new())),
             telemetry: disabled_telemetry_for_tests(telemetry_home),
             repo_origin: RepoOrigin {
@@ -3157,7 +3159,7 @@ mod tests {
             shutdown_tx,
             last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            agent_registry: Arc::new(api_agent::AgentRegistry::new()),
+            agent_registry: Arc::new(api_agent::AgentRegistry::new(mcp_cache.clone())),
         }
     }
 

@@ -2113,6 +2113,38 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                 }
             }
         }
+        [id, action, rest @ ..] if action.eq_ignore_ascii_case("start") && !rest.is_empty() => {
+            let message = rest.join(" ");
+            let payload = serde_json::json!({
+                "type": "start",
+                "payload": { "message": message }
+            });
+            let path = format!("/api/v1/agents/{}/commands", id);
+            match agents_post(&path, &payload) {
+                Ok(body) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&body).unwrap_or_default();
+                    if let Some(msg) = v["message"].as_str() {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Command rejected: {}\n", msg
+                        )));
+                    } else {
+                        let before = v["status_before"].as_str().unwrap_or("?");
+                        let after = v["status_after"].as_str().unwrap_or("?");
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  Command accepted: {} -> {}\n",
+                            before, after
+                        )));
+                        spawn_agent_poll(id, &ctx.agent_poll_tx);
+                    }
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!(
+                        "  agents start failed: {}\n", e
+                    )));
+                }
+            }
+        }
         [id, action] => {
             let action_lower = action.to_ascii_lowercase();
             match action_lower.as_str() {
@@ -2305,12 +2337,14 @@ fn spawn_agent_poll(id: &str, poll_tx: &tokio::sync::mpsc::UnboundedSender<Agent
     let base = agents_base_url();
     std::thread::spawn(move || {
         let client = reqwest::blocking::Client::new();
-        let url = format!("{}/api/v1/agents/{}", base, agent_id);
+        let status_url = format!("{}/api/v1/agents/{}", base, agent_id);
         let mut last_status = String::new();
+        let mut last_event_seq: u64 = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
+            // Fetch status
             let resp = client
-                .get(&url)
+                .get(&status_url)
                 .timeout(std::time::Duration::from_secs(5))
                 .send();
             let body = match resp {
@@ -2333,6 +2367,42 @@ fn spawn_agent_poll(id: &str, poll_tx: &tokio::sync::mpsc::UnboundedSender<Agent
                 });
             }
             last_status = status.clone();
+            // Fetch events
+            let events_url = format!(
+                "{}/api/v1/agents/{}/events?after_seq={}&limit=50",
+                base, agent_id, last_event_seq
+            );
+            if let Ok(Ok(resp)) = client
+                .get(&events_url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .map(|r| {
+                    if r.status().is_success() {
+                        r.text().map_err(|e| anyhow::anyhow!("{}", e))
+                    } else {
+                        Err(anyhow::anyhow!("HTTP {}", r.status().as_u16()))
+                    }
+                })
+            {
+                let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap_or_default();
+                if let Some(items) = parsed["items"].as_array() {
+                    for item in items {
+                        let seq = item["seq"].as_u64().unwrap_or(0);
+                        let event_type = item["event_type"].as_str().unwrap_or("").to_string();
+                        let raw = item["payload"].clone();
+                        let payload = if raw.is_null() { None } else { Some(raw) };
+                        let _ = tx.send(AgentPollEvent::AgentData {
+                            agent_id: agent_id.clone(),
+                            seq,
+                            event_type,
+                            payload,
+                        });
+                        if seq > last_event_seq {
+                            last_event_seq = seq;
+                        }
+                    }
+                }
+            }
             match status.as_str() {
                 "completed" | "failed" | "cancelled" => {
                     let _ = tx.send(AgentPollEvent::PollFinished {

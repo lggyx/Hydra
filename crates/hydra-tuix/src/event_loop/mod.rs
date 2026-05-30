@@ -59,6 +59,12 @@ pub enum AgentPollEvent {
     WaitingInput {
         agent_id: String,
     },
+    AgentData {
+        agent_id: String,
+        seq: u64,
+        event_type: String,
+        payload: Option<serde_json::Value>,
+    },
 }
 
 /// Encode raw RGBA pixel data as a PNG image in memory.
@@ -4959,6 +4965,59 @@ fn handle_agent_poll_event(ev: AgentPollEvent, app: &mut App, ctx: &LoopCtx, ren
                 "  agent-{}: reached terminal state, polling stopped.\n",
                 short_id
             )));
+            renderer.flush();
+        }
+        AgentPollEvent::AgentData { agent_id, event_type, payload, .. } => {
+            let short_id = &agent_id[..8.min(agent_id.len())];
+            match event_type.as_str() {
+                "agent_message" => {
+                    if let Some(ref p) = payload {
+                        if let Some(delta) = p.get("delta").and_then(|v| v.as_str()) {
+                            renderer.render(UiLine::CommandOutput(format!(
+                                "  [{}] {}\n", short_id, delta
+                            )));
+                        }
+                    }
+                }
+                "agent_reasoning" => {
+                    if let Some(ref p) = payload {
+                        if let Some(delta) = p.get("delta").and_then(|v| v.as_str()) {
+                            renderer.render(UiLine::CommandOutput(format!(
+                                "  [{}]  {} \n", short_id, delta
+                            )));
+                        }
+                    }
+                }
+                "tool_call_start" => {
+                    if let Some(ref p) = payload {
+                        if let Some(tool) = p.get("tool").and_then(|v| v.as_str()) {
+                            renderer.render(UiLine::CommandOutput(format!(
+                                "  [{}]  calling {} ...\n", short_id, tool
+                            )));
+                        }
+                    }
+                }
+                "tool_call_result" => {
+                    if let Some(ref p) = payload {
+                        let tool = p.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
+                        let success = p.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let icon = if success { " " } else { " " };
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "  [{}] {} {} \n", short_id, icon, tool
+                        )));
+                    }
+                }
+                "error" => {
+                    if let Some(ref p) = payload {
+                        if let Some(e) = p.get("error").and_then(|v| v.as_str()) {
+                            renderer.render(UiLine::Error(format!(
+                                "  [{}]  error: {}\n", short_id, e
+                            )));
+                        }
+                    }
+                }
+                _ => {}
+            }
             renderer.flush();
         }
     }

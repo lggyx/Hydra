@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::{json_error, AppState};
+use crate::{json_error, AppState, CachedMcpRegistry};
 use hydra_core::config::Config;
+use hydra_core::mcp::{register_mcp_tools, McpRegistry};
 use hydra_core::provider;
 use hydra_core::session::{Session, SessionId, SessionManager};
 use hydra_core::tool::ToolRegistry;
@@ -215,14 +217,16 @@ pub struct AgentRegistry {
     event_store: Arc<RwLock<AgentEventStore>>,
     /// Active agent execution tokens (agent_id -> CancellationToken)
     active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
 }
 
 impl AgentRegistry {
-    pub fn new() -> Self {
+    pub fn new(mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>) -> Self {
         Self {
             store: Arc::new(RwLock::new(AgentStore::new())),
             event_store: Arc::new(RwLock::new(AgentEventStore::new())),
             active_tokens: Arc::new(RwLock::new(HashMap::new())),
+            mcp_cache,
         }
     }
 
@@ -386,6 +390,7 @@ impl AgentRegistry {
         let store = self.store.clone();
         let event_store = self.event_store.clone();
         let active_tokens = self.active_tokens.clone();
+        let mcp_cache = self.mcp_cache.clone();
 
         // Create a new CancellationToken for this execution
         let cancel_token = CancellationToken::new();
@@ -424,6 +429,7 @@ impl AgentRegistry {
                 working_dir,
                 input_text,
                 cancel_token,
+                mcp_cache,
             ).await;
 
             if let Err(_e) = result {
@@ -605,6 +611,7 @@ async fn run_real_execution(
     working_dir: String,
     input_text: Option<String>,
     cancel_token: CancellationToken,
+    mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
 ) -> Result<(), ()> {
     use hydra_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool,
@@ -659,28 +666,78 @@ async fn run_real_execution(
     }
 
     // 6. Build tool registry (mirrors process_chat_request in main.rs)
-    let tool_context = hydra_core::tool::ToolContext::new(working_dir.clone().into());
+    use crate::daemon_tool_enabled;
+    let working_dir_path = PathBuf::from(&working_dir);
+    let mut tool_context = hydra_core::tool::ToolContext::new(working_dir_path.clone());
     let mut tool_registry = ToolRegistry::new();
 
-    tool_registry.register_sync(Box::new(ReadFileTool));
-    tool_registry.register_sync(Box::new(WriteFileTool));
-    tool_registry.register_sync(Box::new(EditFileTool));
-    tool_registry.register_sync(Box::new(BashTool));
-    tool_registry.register_sync(Box::new(GrepTool));
-    tool_registry.register_sync(Box::new(GlobTool));
-    tool_registry.register_sync(Box::new(ListDirTool));
-    tool_registry.register_sync(Box::new(SearchReplaceTool));
-    tool_registry.register_sync(Box::new(WebSearchTool));
-    tool_registry.register_sync(Box::new(WebFetchTool));
-    tool_registry.register_sync(Box::new(TodoTool::new()));
+    if daemon_tool_enabled("read_file") { tool_registry.register_sync(Box::new(ReadFileTool)); }
+    if daemon_tool_enabled("write_file") { tool_registry.register_sync(Box::new(WriteFileTool)); }
+    if daemon_tool_enabled("edit_file") { tool_registry.register_sync(Box::new(EditFileTool)); }
+    if daemon_tool_enabled("bash") { tool_registry.register_sync(Box::new(BashTool)); }
+    if daemon_tool_enabled("grep") { tool_registry.register_sync(Box::new(GrepTool)); }
+    if daemon_tool_enabled("glob") { tool_registry.register_sync(Box::new(GlobTool)); }
+    if daemon_tool_enabled("list_dir") { tool_registry.register_sync(Box::new(ListDirTool)); }
+    if daemon_tool_enabled("search_replace") { tool_registry.register_sync(Box::new(SearchReplaceTool)); }
+    if daemon_tool_enabled("web_search") { tool_registry.register_sync(Box::new(WebSearchTool)); }
+    if daemon_tool_enabled("web_fetch") { tool_registry.register_sync(Box::new(WebFetchTool)); }
+    if daemon_tool_enabled("todo") { tool_registry.register_sync(Box::new(TodoTool::new())); }
+
+    // Load MCP tools from per-project cache
+    {
+        let mcp_registry: Arc<McpRegistry> = {
+            let cache = mcp_cache.read().await;
+            if let Some(cached) = cache.get(&working_dir_path) {
+                cached.registry.clone()
+            } else {
+                drop(cache);
+                let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir_path));
+                new_registry.wait_for_initial_connections(std::time::Duration::from_secs(5)).await;
+                let mut cache = mcp_cache.write().await;
+                if cache.len() >= 5 {
+                    if let Some(oldest_key) = cache
+                        .iter()
+                        .min_by_key(|(_, v)| v.last_used)
+                        .map(|(k, _)| k.clone())
+                    {
+                        cache.remove(&oldest_key);
+                    }
+                }
+                cache.insert(working_dir_path.clone(), CachedMcpRegistry {
+                    registry: new_registry.clone(),
+                    last_used: std::time::Instant::now(),
+                });
+                new_registry
+            }
+        };
+        {
+            let mut cache = mcp_cache.write().await;
+            if let Some(entry) = cache.get_mut(&working_dir_path) {
+                entry.last_used = std::time::Instant::now();
+            }
+        }
+        let mcp_tools = mcp_registry.list_all_tools().await;
+        if !mcp_tools.is_empty() {
+            register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
+        }
+    }
 
     // Load skills and register use_skill tool
     let mut skill_registry = hydra_core::skill::SkillRegistry::new();
     skill_registry.reload(std::path::Path::new(&working_dir));
-    if !skill_registry.is_empty() {
+    let skill_registry_arc = std::sync::Arc::new(std::sync::RwLock::new(skill_registry));
+    if !skill_registry_arc.read().unwrap().is_empty() {
         tool_registry.register_sync(Box::new(hydra_core::tool::use_skill::UseSkillTool {
-            registry: std::sync::Arc::new(std::sync::RwLock::new(skill_registry)),
+            registry: skill_registry_arc.clone(),
         }));
+    }
+
+    // LSP
+    if daemon_tool_enabled("diagnostics") {
+        if let Some(lsp) = hydra_core::lsp::manager::build_lsp_manager(&config.lsp, &working_dir_path) {
+            tool_registry.register_sync(Box::new(hydra_core::tool::diagnostics::DiagnosticsTool));
+            tool_context.lsp = Some(lsp);
+        }
     }
 
     let shared_tools = std::sync::Arc::new(tool_registry);
@@ -713,12 +770,12 @@ async fn run_real_execution(
         loop_guard: Default::default(),
     };
 
-    // 10. Build system prompt (use a simple one for agent execution)
-    let system_prompt = format!(
-        "You are an autonomous coding agent working in {}.\n\
-         You have access to file editing, bash execution, and search tools.\n\
-         Complete the assigned task efficiently and report your results.",
-        working_dir
+    // 10. Build system prompt (from shared daemon helper)
+    let system_prompt = crate::build_api_system_prompt(
+        &working_dir_path,
+        &config,
+        provider_config,
+        &skill_registry_arc,
     );
 
     // 11. Create event channel for TurnEvent → AgentEvent mapping
@@ -967,7 +1024,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_agent_returns_created_status() {
-        let registry = AgentRegistry::new();
+        let registry = AgentRegistry::new(Arc::new(RwLock::new(HashMap::new())));
         let req = CreateAgentRequest {
             name: Some("test-agent".to_string()),
             provider: None,
@@ -985,7 +1042,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_command_transitions_to_queued() {
-        let registry = AgentRegistry::new();
+        let registry = AgentRegistry::new(Arc::new(RwLock::new(HashMap::new())));
         let req = CreateAgentRequest {
             name: Some("agent1".to_string()),
             provider: None,
@@ -1013,7 +1070,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_from_running() {
-        let registry = AgentRegistry::new();
+        let registry = AgentRegistry::new(Arc::new(RwLock::new(HashMap::new())));
         let req = CreateAgentRequest {
             name: None,
             provider: None,
@@ -1043,7 +1100,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_command_returns_conflict() {
-        let registry = AgentRegistry::new();
+        let registry = AgentRegistry::new(Arc::new(RwLock::new(HashMap::new())));
         let req = CreateAgentRequest {
             name: None,
             provider: None,
@@ -1068,7 +1125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_events_after_seq() {
-        let registry = AgentRegistry::new();
+        let registry = AgentRegistry::new(Arc::new(RwLock::new(HashMap::new())));
         let req = CreateAgentRequest {
             name: None,
             provider: None,
@@ -1106,7 +1163,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_agent_with_worktree_and_branch() {
-        let registry = AgentRegistry::new();
+        let registry = AgentRegistry::new(Arc::new(RwLock::new(HashMap::new())));
         let req = CreateAgentRequest {
             name: Some("wt-agent".to_string()),
             provider: None,
@@ -1125,7 +1182,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auto_detect_branch_allows_none_outside_repo() {
-        let registry = AgentRegistry::new();
+        let registry = AgentRegistry::new(Arc::new(RwLock::new(HashMap::new())));
         let req = CreateAgentRequest {
             name: None,
             provider: None,
