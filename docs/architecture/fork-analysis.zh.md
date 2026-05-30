@@ -231,13 +231,15 @@ impl HydraWorkspaceManager {
 use hydra_workspace::HydraWorkspaceManager;
 
 pub struct ResourceManager {
-    agents: Arc<RwLock<AgentRegistry>>,
-    event_bus: mpsc::UnboundedSender<AgentEvent>,
-    subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<AgentEvent>>>>,
-    next_id: AtomicU64,
-    git: Arc<HydraWorkspaceManager>,        // ← ISO-Framework 支持
-    providers: Arc<RwLock<ProviderRegistry>>,
-    tool_registry: Arc<RwLock<ToolRegistry>>,
+    agents:          Arc<RwLock<AgentRegistry>>,
+    event_rx:        mpsc::UnboundedReceiver<AgentEvent>,
+    event_bus:       mpsc::UnboundedSender<AgentEvent>,   // cloned from event_rx half
+    subscribers:     Arc<RwLock<Vec<mpsc::UnboundedSender<AgentEvent>>>>,
+    control_senders: Arc<RwLock<HashMap<AgentId, mpsc::UnboundedSender<AgentCommand>>>>,
+    next_id:         AtomicU64,
+    git:             Arc<dyn GitWorktreeManager>,          // trait object, mockable
+    providers:       Arc<RwLock<ProviderRegistry>>,
+    tool_registry:   Arc<RwLock<ToolRegistry>>,
 }
 
 impl ResourceManager {
