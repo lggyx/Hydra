@@ -2135,7 +2135,7 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                             "  Command accepted: {} -> {}\n",
                             before, after
                         )));
-                        spawn_agent_poll(id, &ctx.agent_poll_tx);
+                        spawn_agent_sse(id, &ctx.agent_poll_tx);
                     }
                 }
                 Err(e) => {
@@ -2166,7 +2166,7 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                                     before, after
                                 )));
                                 if action_lower == "start" {
-                                    spawn_agent_poll(id, &ctx.agent_poll_tx);
+                                    spawn_agent_sse(id, &ctx.agent_poll_tx);
                                 }
                             }
                         }
@@ -2331,6 +2331,84 @@ fn agents_post_command(id: &str, cmd_type: &str) -> Result<String> {
     agents_post(&path, &payload)
 }
 
+fn spawn_agent_sse(id: &str, poll_tx: &tokio::sync::mpsc::UnboundedSender<AgentPollEvent>) {
+    let agent_id = id.to_string();
+    let tx = poll_tx.clone();
+    let base = agents_base_url();
+    std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(None)
+            .build()
+            .expect("build reqwest client");
+        let mut last_event_seq: u64 = 0;
+        loop {
+            let url = if last_event_seq > 0 {
+                format!("{}/api/v1/agents/{}/events/stream?after_seq={}", base, agent_id, last_event_seq)
+            } else {
+                format!("{}/api/v1/agents/{}/events/stream", base, agent_id)
+            };
+            let resp = match client.get(&url).send() {
+                Ok(r) if r.status().is_success() => r,
+                _ => {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    continue;
+                }
+            };
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(resp);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        let line = line.trim().to_string();
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
+                                let seq = event["seq"].as_u64().unwrap_or(0);
+                                let event_type = event["event_type"].as_str().unwrap_or("").to_string();
+                                // Detect status changes from status_changed events
+                                if event_type == "status_changed" {
+                                    if let Some(ref p) = event["payload"].as_object() {
+                                        if let Some(status) = p.get("status").and_then(|v| v.as_str()) {
+                                            let _ = tx.send(AgentPollEvent::StatusChanged {
+                                                agent_id: agent_id.clone(),
+                                                old_status: String::new(),
+                                                new_status: status.to_string(),
+                                            });
+                                            if status == "waiting_input" {
+                                                let _ = tx.send(AgentPollEvent::WaitingInput {
+                                                    agent_id: agent_id.clone(),
+                                                });
+                                            }
+                                            if matches!(status, "completed" | "failed" | "cancelled") {
+                                                let _ = tx.send(AgentPollEvent::PollFinished {
+                                                    agent_id: agent_id.clone(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                let raw = event["payload"].clone();
+                                let payload = if raw.is_null() { None } else { Some(raw) };
+                                let _ = tx.send(AgentPollEvent::AgentData {
+                                    agent_id: agent_id.clone(),
+                                    seq,
+                                    event_type,
+                                    payload,
+                                });
+                                if seq > last_event_seq {
+                                    last_event_seq = seq;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
+}
+
+#[allow(dead_code)]
 fn spawn_agent_poll(id: &str, poll_tx: &tokio::sync::mpsc::UnboundedSender<AgentPollEvent>) {
     let agent_id = id.to_string();
     let tx = poll_tx.clone();
@@ -2342,7 +2420,6 @@ fn spawn_agent_poll(id: &str, poll_tx: &tokio::sync::mpsc::UnboundedSender<Agent
         let mut last_event_seq: u64 = 0;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
-            // Fetch status
             let resp = client
                 .get(&status_url)
                 .timeout(std::time::Duration::from_secs(5))
@@ -2367,7 +2444,6 @@ fn spawn_agent_poll(id: &str, poll_tx: &tokio::sync::mpsc::UnboundedSender<Agent
                 });
             }
             last_status = status.clone();
-            // Fetch events
             let events_url = format!(
                 "{}/api/v1/agents/{}/events?after_seq={}&limit=50",
                 base, agent_id, last_event_seq

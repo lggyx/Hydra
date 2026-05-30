@@ -5,8 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{sse, IntoResponse};
 use axum::Json;
+use futures::stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -218,6 +220,7 @@ pub struct AgentRegistry {
     /// Active agent execution tokens (agent_id -> CancellationToken)
     active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
     mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
+    event_broadcasts: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
 }
 
 impl AgentRegistry {
@@ -227,6 +230,7 @@ impl AgentRegistry {
             event_store: Arc::new(RwLock::new(AgentEventStore::new())),
             active_tokens: Arc::new(RwLock::new(HashMap::new())),
             mcp_cache,
+            event_broadcasts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -376,6 +380,24 @@ impl AgentRegistry {
         })
     }
 
+    /// Subscribe to live agent events via broadcast channel.
+    pub(crate) async fn subscribe_events(
+        &self,
+        agent_id: &str,
+    ) -> Result<tokio::sync::broadcast::Receiver<AgentEvent>, (StatusCode, String)> {
+        {
+            let store = self.store.read().await;
+            if store.get(agent_id).is_none() {
+                return Err((StatusCode::NOT_FOUND, format!("agent {} not found", agent_id)));
+            }
+        }
+        let mut bcasts = self.event_broadcasts.write().await;
+        let tx = bcasts
+            .entry(agent_id.to_string())
+            .or_insert_with(|| tokio::sync::broadcast::channel(256).0);
+        Ok(tx.subscribe())
+    }
+
     /// Cancel an active agent execution. Works for Running and WaitingInput states.
     pub(crate) async fn cancel_agent_execution(&self, agent_id: &str) {
         let tokens = self.active_tokens.read().await;
@@ -391,6 +413,7 @@ impl AgentRegistry {
         let event_store = self.event_store.clone();
         let active_tokens = self.active_tokens.clone();
         let mcp_cache = self.mcp_cache.clone();
+        let event_broadcasts = self.event_broadcasts.clone();
 
         // Create a new CancellationToken for this execution
         let cancel_token = CancellationToken::new();
@@ -416,7 +439,7 @@ impl AgentRegistry {
                 }
                 None => {
                     set_status(&store, &agent_id, AgentStatus::Failed);
-                    append_event(&event_store, &agent_id, "status_changed", Some(serde_json::json!({"status": "failed", "error": "agent not found"})));
+                    append_event(&event_store, &event_broadcasts, &agent_id, "status_changed", Some(serde_json::json!({"status": "failed", "error": "agent not found"})));
                     return;
                 }
             };
@@ -425,6 +448,7 @@ impl AgentRegistry {
             let result = run_real_execution(
                 store.clone(),
                 event_store.clone(),
+                event_broadcasts.clone(),
                 agent_id.clone(),
                 working_dir,
                 input_text,
@@ -434,7 +458,7 @@ impl AgentRegistry {
 
             if let Err(_e) = result {
                 // Fall back to mock progression so tests and simple cases still work
-                run_mock_progression(store, event_store, agent_id).await;
+                run_mock_progression(store, event_store, event_broadcasts, agent_id).await;
             }
         });
     }
@@ -445,6 +469,7 @@ impl AgentRegistry {
 async fn run_mock_progression(
     store: Arc<RwLock<AgentStore>>,
     event_store: Arc<RwLock<AgentEventStore>>,
+    event_broadcasts: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
     agent_id: String,
 ) {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -452,47 +477,13 @@ async fn run_mock_progression(
         let mut s = store.write().await;
         s.update_status(&agent_id, AgentStatus::Running);
     }
-    {
-        let mut es = event_store.write().await;
-        let seq = es
-            .events
-            .get(&agent_id)
-            .map(|v| v.len() as u64 + 1)
-            .unwrap_or(1);
-        es.append(
-            &agent_id,
-            AgentEvent {
-                seq,
-                agent_id: agent_id.clone(),
-                event_type: "status_changed".to_string(),
-                timestamp: now_ts(),
-                payload: Some(serde_json::json!({"status": "running"})),
-            },
-        );
-    }
+    append_event(&event_store, &event_broadcasts, &agent_id, "status_changed", Some(serde_json::json!({"status": "running"})));
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     {
         let mut s = store.write().await;
         s.update_status(&agent_id, AgentStatus::Completed);
     }
-    {
-        let mut es = event_store.write().await;
-        let seq = es
-            .events
-            .get(&agent_id)
-            .map(|v| v.len() as u64 + 1)
-            .unwrap_or(1);
-        es.append(
-            &agent_id,
-            AgentEvent {
-                seq,
-                agent_id: agent_id.clone(),
-                event_type: "status_changed".to_string(),
-                timestamp: now_ts(),
-                payload: Some(serde_json::json!({"status": "completed"})),
-            },
-        );
-    }
+    append_event(&event_store, &event_broadcasts, &agent_id, "status_changed", Some(serde_json::json!({"status": "completed"})));
 }
 
 // Helper to set agent status
@@ -508,6 +499,7 @@ fn set_status(
 // Helper to append an event
 fn append_event(
     event_store: &Arc<RwLock<AgentEventStore>>,
+    event_broadcasts: &Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
     agent_id: &str,
     event_type: &str,
     payload: Option<serde_json::Value>,
@@ -518,16 +510,18 @@ fn append_event(
         .get(agent_id)
         .map(|v| v.len() as u64 + 1)
         .unwrap_or(1);
-    es.append(
-        agent_id,
-        AgentEvent {
-            seq,
-            agent_id: agent_id.to_string(),
-            event_type: event_type.to_string(),
-            timestamp: now_ts(),
-            payload,
-        },
-    );
+    let event = AgentEvent {
+        seq,
+        agent_id: agent_id.to_string(),
+        event_type: event_type.to_string(),
+        timestamp: now_ts(),
+        payload,
+    };
+    es.append(agent_id, event.clone());
+    let bcasts = event_broadcasts.blocking_read();
+    if let Some(tx) = bcasts.get(agent_id) {
+        let _ = tx.send(event);
+    }
 }
 
 /// Extract a message string from a command payload.
@@ -607,6 +601,7 @@ fn resolve_worktree_path(repo_dir: &str, branch: &str) -> Option<String> {
 async fn run_real_execution(
     store: Arc<RwLock<AgentStore>>,
     event_store: Arc<RwLock<AgentEventStore>>,
+    event_broadcasts: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
     agent_id: String,
     working_dir: String,
     input_text: Option<String>,
@@ -785,6 +780,7 @@ async fn run_real_execution(
     set_status(&store, &agent_id, AgentStatus::Running);
     append_event(
         &event_store,
+        &event_broadcasts,
         &agent_id,
         "status_changed",
         Some(serde_json::json!({"status": "running"})),
@@ -799,6 +795,7 @@ async fn run_real_execution(
             set_status(&store, &agent_id, AgentStatus::Cancelled);
             append_event(
                 &event_store,
+                &event_broadcasts,
                 &agent_id,
                 "status_changed",
                 Some(serde_json::json!({"status": "cancelled"})),
@@ -808,7 +805,7 @@ async fn run_real_execution(
 
         // Drain any pending turn events from previous iteration
         while let Ok(evt) = turn_rx.try_recv() {
-            map_turn_event(&event_store, &agent_id, &evt, &mut total_tool_calls);
+            map_turn_event(&event_store, &event_broadcasts, &agent_id, &evt, &mut total_tool_calls);
         }
 
         let result = turn_runner
@@ -817,7 +814,7 @@ async fn run_real_execution(
 
         // Drain events from this turn
         while let Ok(evt) = turn_rx.try_recv() {
-            map_turn_event(&event_store, &agent_id, &evt, &mut total_tool_calls);
+            map_turn_event(&event_store, &event_broadcasts, &agent_id, &evt, &mut total_tool_calls);
         }
 
         match result {
@@ -827,6 +824,7 @@ async fn run_real_execution(
                 set_status(&store, &agent_id, AgentStatus::Failed);
                 append_event(
                     &event_store,
+                    &event_broadcasts,
                     &agent_id,
                     "status_changed",
                     Some(serde_json::json!({"status": "failed", "error": e})),
@@ -837,6 +835,7 @@ async fn run_real_execution(
                 set_status(&store, &agent_id, AgentStatus::Cancelled);
                 append_event(
                     &event_store,
+                    &event_broadcasts,
                     &agent_id,
                     "status_changed",
                     Some(serde_json::json!({"status": "cancelled"})),
@@ -856,6 +855,7 @@ async fn run_real_execution(
     set_status(&store, &agent_id, AgentStatus::Completed);
     append_event(
         &event_store,
+        &event_broadcasts,
         &agent_id,
         "status_changed",
         Some(serde_json::json!({
@@ -871,6 +871,7 @@ async fn run_real_execution(
 /// Map a TurnEvent from TurnRunner into an AgentEvent in the event store.
 fn map_turn_event(
     event_store: &Arc<RwLock<AgentEventStore>>,
+    event_broadcasts: &Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
     agent_id: &str,
     evt: &TurnEvent,
     tool_calls: &mut usize,
@@ -879,6 +880,7 @@ fn map_turn_event(
         TurnEvent::TextDelta(text) => {
             append_event(
                 event_store,
+                event_broadcasts,
                 agent_id,
                 "agent_message",
                 Some(serde_json::json!({"delta": text})),
@@ -887,6 +889,7 @@ fn map_turn_event(
         TurnEvent::ReasoningDelta(text) => {
             append_event(
                 event_store,
+                event_broadcasts,
                 agent_id,
                 "agent_reasoning",
                 Some(serde_json::json!({"delta": text})),
@@ -895,6 +898,7 @@ fn map_turn_event(
         TurnEvent::ToolCallStreaming { name, .. } => {
             append_event(
                 event_store,
+                event_broadcasts,
                 agent_id,
                 "tool_call_start",
                 Some(serde_json::json!({"tool": name})),
@@ -903,6 +907,7 @@ fn map_turn_event(
         TurnEvent::ToolCallStarted { name, .. } => {
             append_event(
                 event_store,
+                event_broadcasts,
                 agent_id,
                 "tool_call_start",
                 Some(serde_json::json!({"tool": name})),
@@ -912,6 +917,7 @@ fn map_turn_event(
             *tool_calls += 1;
             append_event(
                 event_store,
+                event_broadcasts,
                 agent_id,
                 "tool_call_result",
                 Some(serde_json::json!({"tool": name, "success": success})),
@@ -921,6 +927,7 @@ fn map_turn_event(
             let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
             append_event(
                 event_store,
+                event_broadcasts,
                 agent_id,
                 "tool_batch_start",
                 Some(serde_json::json!({"tools": names})),
@@ -929,6 +936,7 @@ fn map_turn_event(
         TurnEvent::ToolBatchCompleted { ok, total, .. } => {
             append_event(
                 event_store,
+                event_broadcasts,
                 agent_id,
                 "tool_batch_complete",
                 Some(serde_json::json!({"ok": ok, "total": total})),
@@ -937,6 +945,7 @@ fn map_turn_event(
         TurnEvent::Error(e) => {
             append_event(
                 event_store,
+                event_broadcasts,
                 agent_id,
                 "error",
                 Some(serde_json::json!({"error": e})),
@@ -950,6 +959,7 @@ fn map_turn_event(
         } => {
             append_event(
                 event_store,
+                event_broadcasts,
                 agent_id,
                 "token_usage",
                 Some(serde_json::json!({
@@ -1016,6 +1026,77 @@ pub(crate) async fn list_agent_events(
         Some(resp) => Json(resp).into_response(),
         None => json_error(StatusCode::NOT_FOUND, format!("agent {} not found", id)).into_response(),
     }
+}
+
+pub(crate) async fn stream_agent_events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ListAgentEventsQuery>,
+) -> impl IntoResponse {
+    let after_seq = q.after_seq.unwrap_or(0);
+    let registry = state.agent_registry.clone();
+
+    // Replay missed events from the store
+    let missed_events = if after_seq > 0 {
+        registry
+            .get_events(&id, after_seq, 500)
+            .await
+            .map(|r| r.items)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Subscribe to live events
+    let mut rx = match registry.subscribe_events(&id).await {
+        Ok(rx) => rx,
+        Err((status, msg)) => return (status, Json(serde_json::json!({"error": msg}))).into_response(),
+    };
+
+    let (tx, rx_stream) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+
+    // Spawn a task that replays history then forwards live events
+    tokio::spawn(async move {
+        // Replay phase
+        for ev in missed_events {
+            let _ = tx.send(ev);
+        }
+        // Live phase
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    if tx.send(ev).is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("SSE client lagged by {} events for agent {}", n, id);
+                    continue;
+                }
+            }
+        }
+    });
+
+    let active_conns = state.active_connections.clone();
+    active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let stream = UnboundedReceiverStream::new(rx_stream).map(|event| {
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(sse::Event::default().data(json))
+    });
+
+    let conn_guard = crate::SseConnectionGuard(active_conns);
+    let guarded_stream = stream.chain(futures::stream::once(async move {
+        drop(conn_guard);
+        Ok(sse::Event::default().comment("bye"))
+    }));
+
+    sse::Sse::new(guarded_stream).keep_alive(
+        sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    ).into_response()
 }
 
 #[cfg(test)]

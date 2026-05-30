@@ -2955,6 +2955,7 @@ async fn main() {
         .route("/api/v1/agents/:id", get(api_agent::get_agent))
         .route("/api/v1/agents/:id/commands", post(api_agent::post_agent_command))
         .route("/api/v1/agents/:id/events", get(api_agent::list_agent_events))
+        .route("/api/v1/agents/:id/events/stream", get(api_agent::stream_agent_events))
         .route("/api/v1/worktrees", get(api_worktree::list_worktrees).post(api_worktree::create_worktree))
         .route("/api/v1/worktrees/:id", delete(api_worktree::delete_worktree))
         .route("/api/v1/branches", get(api_branch::list_branches).post(api_branch::create_branch))
