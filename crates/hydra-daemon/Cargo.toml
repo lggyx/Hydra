@@ -26,6 +26,7 @@ uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
 regex = "1"
 tracing = "0.1"
+scopeguard = "1.2"
 
 [dev-dependencies]
 hydra-telemetry = { path = "../hydra-telemetry", features = ["test-util"] }
