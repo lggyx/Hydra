@@ -83,7 +83,6 @@ extensions/vscode/resources/bin/
 
 # Hydra local-scope configs (machine-specific)
 .hydra/local/
-crates/hydra-codingplan-crypto/
 scripts/build-official.sh
 build-official.sh
 build-official-vscode.sh
