@@ -58,6 +58,9 @@ pub struct AgentSnapshot {
     pub worktree_id: Option<String>,
     pub branch_name: Option<String>,
     pub parent_agent_id: Option<String>,
+    /// Pending user input to inject into the conversation on next execution.
+    #[serde(skip)]
+    pub pending_input: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +242,7 @@ impl AgentRegistry {
             worktree_id: None,
             branch_name: None,
             parent_agent_id: None,
+            pending_input: req.initial_input,
         };
         self.store.write().await.insert(agent.clone());
         agent
@@ -318,10 +322,14 @@ impl AgentRegistry {
 
         let command_id = uuid::Uuid::new_v4().to_string();
 
+        // Extract message text from payload; fall back to pending_input from creation
+        let input_text = extract_message_from_payload(&req.payload)
+            .or(current.pending_input);
+
         if req.type_.as_str() == "start" {
-            self.spawn_agent_execution(id.to_string()).await;
+            self.spawn_agent_execution(id.to_string(), input_text).await;
         } else if req.type_.as_str() == "append_input" {
-            self.spawn_agent_execution(id.to_string()).await;
+            self.spawn_agent_execution(id.to_string(), input_text).await;
         } else if req.type_.as_str() == "cancel" {
             self.cancel_agent_execution(&id).await;
         }
@@ -370,7 +378,7 @@ impl AgentRegistry {
 
     /// Spawn a real agent execution using hydra-core's TurnRunner.
     /// Falls back to mock progression if config/provider setup fails.
-    pub(crate) async fn spawn_agent_execution(&self, agent_id: String) {
+    pub(crate) async fn spawn_agent_execution(&self, agent_id: String, input_text: Option<String>) {
         let store = self.store.clone();
         let event_store = self.event_store.clone();
         let active_tokens = self.active_tokens.clone();
@@ -406,6 +414,7 @@ impl AgentRegistry {
                 event_store.clone(),
                 agent_id.clone(),
                 working_dir,
+                input_text,
                 cancel_token,
             ).await;
 
@@ -507,6 +516,35 @@ fn append_event(
     );
 }
 
+/// Extract a message string from a command payload.
+/// Accepts `message`, `text`, or `input` keys at the top level or nested under `input`.
+fn extract_message_from_payload(payload: &Option<serde_json::Value>) -> Option<String> {
+    let obj = payload.as_ref()?;
+    let obj = obj.as_object()?;
+    for key in &["message", "text", "input"] {
+        if let Some(v) = obj.get(*key) {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    // Also try nested: payload.input.message
+    if let Some(input_obj) = obj.get("input").and_then(|v| v.as_object()) {
+        for key in &["message", "text"] {
+            if let Some(v) = input_obj.get(*key) {
+                if let Some(s) = v.as_str() {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Try to execute a real LLM turn loop for the given agent.
 /// Returns Ok(()) on success, Err(()) on any failure (caller falls back to mock).
 async fn run_real_execution(
@@ -514,11 +552,13 @@ async fn run_real_execution(
     event_store: Arc<RwLock<AgentEventStore>>,
     agent_id: String,
     working_dir: String,
+    input_text: Option<String>,
     cancel_token: CancellationToken,
 ) -> Result<(), ()> {
     use hydra_core::tool::{
         bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool,
         list_dir::ListDirTool, read::ReadFileTool, search_replace::SearchReplaceTool,
+        todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool,
         write::WriteFileTool,
     };
     // 1. Load config
@@ -558,11 +598,16 @@ async fn run_real_execution(
         }
     };
 
-    // 5. Build conversation
+    // 5. Build conversation from session messages
     let mut conversation = hydra_core::conversation::Conversation::new();
     conversation.messages = session.messages.clone();
 
-    // 6. Build tool registry (mirrors process_chat_request)
+    // Inject pending input as the first user message if present
+    if let Some(ref text) = input_text {
+        conversation.add_user_message(text);
+    }
+
+    // 6. Build tool registry (mirrors process_chat_request in main.rs)
     let tool_context = hydra_core::tool::ToolContext::new(working_dir.clone().into());
     let mut tool_registry = ToolRegistry::new();
 
@@ -574,6 +619,18 @@ async fn run_real_execution(
     tool_registry.register_sync(Box::new(GlobTool));
     tool_registry.register_sync(Box::new(ListDirTool));
     tool_registry.register_sync(Box::new(SearchReplaceTool));
+    tool_registry.register_sync(Box::new(WebSearchTool));
+    tool_registry.register_sync(Box::new(WebFetchTool));
+    tool_registry.register_sync(Box::new(TodoTool::new()));
+
+    // Load skills and register use_skill tool
+    let mut skill_registry = hydra_core::skill::SkillRegistry::new();
+    skill_registry.reload(std::path::Path::new(&working_dir));
+    if !skill_registry.is_empty() {
+        tool_registry.register_sync(Box::new(hydra_core::tool::use_skill::UseSkillTool {
+            registry: std::sync::Arc::new(std::sync::RwLock::new(skill_registry)),
+        }));
+    }
 
     let shared_tools = std::sync::Arc::new(tool_registry);
 
