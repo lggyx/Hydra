@@ -73,7 +73,7 @@ pub trait Agent: Send + Sync {
     fn worktree(&self) -> Option<&Path>;     // worktree 路径（如果有）
 
     /// 主循环。运行直到 Completed、Killed 或 Failed。
-    async fn run(&mut self, resources: &ResourceHandle) -> anyhow::Result<AgentOutcome>;
+    async fn run(&mut self, resources: ResourceHandle) -> anyhow::Result<AgentOutcome>;
 
     /// 处理来自 ResourceManager 的指令。返回 true 表示 Agent
     /// 已确认并将执行该指令；false 表示拒绝。
@@ -170,7 +170,7 @@ pub enum AgentKind {
     Execution,       /// 修改代码、运行工具、产出 diff
     Orchestrator,    /// 生成其他 Agent、做出调度决策
     Reviewer,        /// 检查代码/diff、产出质量分数
-    Custom(&'static str),  // 扩展点
+    Custom(String),  // 扩展点
 }
 ```
 
@@ -197,7 +197,7 @@ pub enum AgentStatus {
 }
 ```
 
-`AgentState` 存储在 ResourceManager 的 `Arc<RwLock<>>` 中。订阅者读取快照；绝不持有可变引用。
+`AgentState` 以 `Arc<RwLock<>>` 形式存储在 ResourceManager 的 AgentRegistry 中，订阅者持有克隆的 Arc 只读观察。**Agent 自身是其状态的唯一写入者**（更新状态、轮次计数、时间戳）。订阅者和 ResourceManager 仅持有只读快照或 `Weak` 引用。除持有 Agent 外，没有任何组件对其状态调用 `write()`。
 
 ### 3.6 AgentEvent（统一事件流）
 
@@ -282,7 +282,7 @@ pub struct ResourceManager {
     subscribers:    Arc<RwLock<Vec<mpsc::UnboundedSender<AgentEvent>>>>,
     next_id:        AtomicU64,
     // 共享基础设施（克隆给每个 AgentHandle）
-    git:            Arc<GitWorktreeManager>,    // ← 来自 ISO-Framework
+    git:            Arc<dyn GitWorktreeManager>,    // ← 来自 ISO-Framework
     providers:      Arc<RwLock<ProviderRegistry>>,
     tool_registry:  Arc<RwLock<ToolRegistry>>,
 }
@@ -483,7 +483,7 @@ hydra/
 │   │   │   ├── reviewer.rs     # ReviewerAgent（可选）
 │   │   │   ├── provider/       # LlmProvider trait + 实现
 │   │   │   │   ├── mod.rs
-│   │   │   │   ├── openai.rs   # OpenAI / DeepSeek / 硅基流动
+│   │   │   │   ├── openai.rs   # OpenAI / DeepSeek
 │   │   │   │   ├── anthropic.rs # Claude
 │   │   │   │   └── ollama.rs    # 本地模型
 │   │   │   ├── tools/          # Tool trait + 内置工具
@@ -696,7 +696,7 @@ Phase 0（1 周）：基础
   - 定义 AgentCommand + AgentOutcome
 
 Phase 1（1 周）：ExecutionAgent
-  - 封装 SubAgentTask → ExecutionAgent
+  - 从零实现 ExecutionAgent（基于 §3.1 Agent trait）
   - 工具范围限制（ScopedReadFile 模式）
   - ToolContext 使用 worktree 作为 cwd
   - TurnEvent → AgentEvent 映射

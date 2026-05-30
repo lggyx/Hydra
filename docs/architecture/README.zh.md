@@ -58,7 +58,7 @@ hydra/
 | 阶段 | 周期 | 交付物 |
 |------|------|--------|
 | Phase 0 | 1 周 | Fork ISO-Framework + Agent trait + ResourceManager 骨架 |
-| Phase 1 | 1 周 | ExecutionAgent（封装 atomcode 的 SubAgentTask） |
+| Phase 1 | 1 周 | ExecutionAgent（实现 Agent trait + tool scoping） |
 | Phase 2 | 1 周 | OrchestratorAgent（LLM 驱动调度器） |
 | Phase 3 | 1 周 | 可视化：StateServer + CLI + VSCode 扩展 |
 | Phase 4 | 1 周 | 优化：QualityGate trait、多模型 fallback、遥测 |

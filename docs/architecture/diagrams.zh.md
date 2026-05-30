@@ -37,9 +37,9 @@ flowchart TB
 
     subgraph "工作区层"
         ISO["HydraWorkspaceManager<br/>(ISO-Framework)"]
-        WT1[".worktrees/wt-1/"]
-        WT2[".worktrees/wt-2/"]
-        WTR[".worktrees/wt-r/"]
+    WT1["wt-1/"]
+    WT2["wt-2/"]
+    WTR["wt-r/"]
     end
 
     subgraph "Git 层"

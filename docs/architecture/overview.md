@@ -223,7 +223,9 @@ pub enum AgentStatus {
 }
 ```
 
-`AgentState` is stored as `Arc<RwLock<AgentState>>`. ResourceManager's AgentRegistry holds clones of the same Arc for observation. **The agent itself is the sole writer** to its own state (updating status, turn count, timestamps). Subscribers and ResourceManager hold read-only snapshots or `Weak` references. No component other than the owning agent calls `write()` on its state.
+`AgentState` is stored as `Arc<RwLock<AgentState>>`. The owning agent holds the strong `Arc` and is the **sole writer** (updating status, turn count, timestamps). ResourceManager's AgentRegistry holds `Weak` references for read-only observation. When the agent is dropped the `Arc` is released and the `Weak` entry in the Registry automatically becomes invalid — no manual cleanup needed.
+
+This guarantees at the type level that no component other than the owning agent can acquire a write lock on its state.
 
 ### 3.6 AgentEvent (unified event stream)
 
@@ -265,14 +267,60 @@ pub enum AgentCommand {
 
     // Orchestrator
     SubmitTask { description: String },
-    SetPolicy  { policy: Policy },
+    SetPolicy  { policy: Box<dyn Policy> },
 
     // Reviewer
     ReviewTarget { branch: String, scope: Vec<String> },
 }
 ```
 
-### 3.8 AgentOutcome (return value from run())
+### 3.8 Policy (safety floor)
+
+```rust
+/// Trait for quality / safety policies. The Orchestrator uses LLM for
+/// scheduling decisions; Policy provides the hard-coded safety floors.
+#[async_trait]
+pub trait Policy: Send + Sync {
+    /// Return true if the agent has run enough turns to be eligible for kill.
+    fn min_turns_before_kill(&self) -> usize;
+
+    /// Return true if the agent should be retried instead of killed on failure.
+    fn allow_retry(&self, turn: usize, error: &str) -> bool;
+
+    /// Return true if the agent's outcome is acceptable for promotion.
+    fn accept_threshold(&self) -> f64;
+}
+
+/// Default policy: hard-coded safety floors.
+pub struct DefaultPolicy {
+    pub min_turns: usize,
+    pub retry_limit: usize,
+    pub min_score: f64,
+}
+
+#[async_trait]
+impl Policy for DefaultPolicy {
+    fn min_turns_before_kill(&self) -> usize { self.min_turns }
+    fn allow_retry(&self, turn: usize, _error: &str) -> bool { turn < self.retry_limit }
+    fn accept_threshold(&self) -> f64 { self.min_score }
+}
+```
+
+### 3.9 AgentHandle (opaque spawn result)
+
+```rust
+/// Opaque handle returned by ResourceManager::spawn().
+/// Carries the agent's runtime identity so callers can refer to it.
+#[derive(Debug, Clone)]
+pub struct AgentHandle {
+    pub id: AgentId,
+    // AgentHandle is a lightweight reference; the real state lives in
+    // ResourceManager's AgentRegistry.  Callers use `id` to look up
+    // snapshots or send commands.
+}
+```
+
+### 3.10 AgentOutcome (return value from run())
 
 ```rust
 #[derive(Debug, Clone, Serialize)]
@@ -316,19 +364,37 @@ pub struct ResourceManager {
     tool_registry:  Arc<RwLock<ToolRegistry>>,
 }
 
+/// Internal struct assembled by build_handle() — not exposed publicly.
+struct AgentBuildResult {
+    agent:    Box<dyn Agent>,        // concrete agent, boxed for uniform storage
+    state:    Arc<RwLock<AgentState>>,  // agent owns the strong Arc; Registry gets Weak
+    resources: ResourceHandle,
+}
+
 impl ResourceManager {
-    /// Spawn a new agent. Returns AgentId and a handle for observation.
+    /// Build an agent + its ResourceHandle.  Implementation detail of spawn().
+    fn build_handle(&self, id: AgentId, kind: AgentKind, spec: AgentSpec)
+        -> Result<AgentBuildResult>
+    {
+        // ... concrete agent construction based on kind ...
+        // ... creates state Arc, clones shared infra into ResourceHandle ...
+        todo!()
+    }
+
+    /// Spawn a new agent. Returns an AgentHandle with the assigned AgentId.
     pub fn spawn(&self, kind: AgentKind, spec: AgentSpec) -> Result<AgentHandle> {
         let id = AgentId(self.next_id.fetch_add(1, Ordering::SeqCst));
 
-        // Create agent with cloned ResourceHandle (agent owns its channels)
+        // Build ResourceHandle (agent owns its channels + shared infra)
         let handle = self.build_handle(id, kind, spec)?;
 
         // Register the agent's control sender so send_command can route to it
         self.control_senders.write().unwrap().insert(id, handle.control_tx.clone());
 
+        // Register the agent's state Arc in the AgentRegistry for observation
+        self.agents.write().unwrap().insert(id, handle.state.clone());
+
         // Start the agent's run loop in a background task
-        let rm_handle = self.spawn_handle.clone();
         let event_tx = self.event_bus.clone();
         tokio::spawn(async move {
             let mut agent = handle.agent;
@@ -336,7 +402,7 @@ impl ResourceManager {
             event_tx.send(AgentEvent::Completed { agent_id: id, outcome }).ok();
         });
 
-        Ok(AgentHandle { id, state: /* ... */ })
+        Ok(AgentHandle { id })
     }
 
     /// Send a command to a specific agent.
@@ -407,13 +473,15 @@ deciding promote/kill/retry.
 ```rust
 pub struct OrchestratorAgent {
     id:             AgentId,
-    conversation:   Conversation,       // its own LLM context
+    branch:         Option<String>,       // Orchestrator has no worktree
+    worktree:       Option<PathBuf>,      // — returns None from trait impl
+    conversation:   Conversation,         // its own LLM context
     runner:         TurnRunner,
     state:          Arc<RwLock<AgentState>>,
-    event_rx:       mpsc::UnboundedReceiver<AgentEvent>,  // all events
+    event_tx:       mpsc::UnboundedSender<AgentEvent>,  // sends events (like all agents)
     control_rx:     mpsc::UnboundedReceiver<AgentCommand>,
-    resources:      ResourceHandle,     // to spawn new agents
-    policy:         Arc<RwLock<Policy>>,
+    resources:      ResourceHandle,       // to spawn new agents
+    policy:         Arc<RwLock<dyn Policy>>,
 }
 ```
 
@@ -425,6 +493,8 @@ pub struct OrchestratorAgent {
 - `declare_complete(summary)` → terminates itself
 
 It does NOT have `edit_file`, `bash`, `read_file`. It orchestrates, it doesn't execute.
+
+Its `branch()` and `worktree()` always return `None` — it has no worktree of its own.
 
 ### 5.3 ReviewerAgent (optional, pluggable)
 
@@ -757,7 +827,7 @@ Phase 0 (1 week): Foundations
   - Define AgentCommand + AgentOutcome
 
 Phase 1 (1 week): ExecutionAgent
-  - Wrap SubAgentTask → ExecutionAgent
+  - Implement ExecutionAgent from scratch (trait-based from §3.1)
   - Tool scoping (ScopedReadFile pattern)
   - ToolContext with worktree cwd
   - TurnEvent → AgentEvent mapping

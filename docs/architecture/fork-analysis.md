@@ -242,15 +242,33 @@ pub struct ResourceManager {
     tool_registry:   Arc<RwLock<ToolRegistry>>,
 }
 
+/// Internal struct assembled by build_handle() — not exposed publicly.
+struct AgentBuildResult {
+    agent:    Box<dyn Agent>,        // concrete agent, boxed for uniform storage
+    state:    Arc<RwLock<AgentState>>,  // agent owns the strong Arc; Registry gets Weak
+    resources: ResourceHandle,
+}
+
 impl ResourceManager {
+    /// Build an agent + its ResourceHandle.  Implementation detail of spawn().
+    fn build_handle(&self, id: AgentId, kind: AgentKind, spec: AgentSpec)
+        -> Result<AgentBuildResult>
+    {
+        // ... concrete agent construction based on kind ...
+        todo!()
+    }
+
     pub fn spawn(&self, kind: AgentKind, spec: AgentSpec) -> Result<AgentHandle> {
         let id = AgentId(self.next_id.fetch_add(1, Ordering::SeqCst));
 
-        // Build ResourceHandle (agent owns its channels)
+        // Build ResourceHandle (agent owns its channels + shared infra)
         let handle = self.build_handle(id, kind, spec)?;
 
-        // Register control sender so send_command can route to this agent
-        self.control_senders.write().unwrap().insert(id, handle.control_tx.clone());
+        // Register the agent's control sender so send_command can route to it
+        self.control_senders.write().unwrap().insert(id, handle.resources.control_tx.clone());
+
+        // Register the agent's state Arc in the AgentRegistry for observation
+        self.agents.write().unwrap().insert(id, handle.state.clone());
 
         // Spawn agent's run loop
         let event_tx = self.event_bus.clone();
@@ -260,7 +278,7 @@ impl ResourceManager {
             event_tx.send(AgentEvent::Completed { agent_id: id, outcome }).ok();
         });
 
-        Ok(AgentHandle { id, state: /* ... */ })
+        Ok(AgentHandle { id })
     }
 
     pub fn send_command(&self, id: AgentId, cmd: AgentCommand) -> Result<()> {

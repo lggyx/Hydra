@@ -58,7 +58,7 @@ See [overview.md § 8](./overview.md#8-crate-structure) for full crate layout an
 | Phase | Duration | Deliverable |
 |-------|----------|-------------|
 | Phase 0 | 1 week | Fork ISO-Framework + Agent trait + ResourceManager skeleton |
-| Phase 1 | 1 week | ExecutionAgent (wraps atomcode's SubAgentTask) |
+| Phase 1 | 1 week | ExecutionAgent (implements Agent trait + tool scoping) |
 | Phase 2 | 1 week | OrchestratorAgent (LLM-driven scheduler) |
 | Phase 3 | 1 week | Visibility: StateServer + CLI + VSCode extension |
 | Phase 4 | 1 week | Polish: QualityGate trait, multi-model fallback, telemetry |
