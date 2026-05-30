@@ -91,6 +91,8 @@ pub(crate) struct CreateAgentRequest {
     pub session_id: Option<String>,
     pub initial_input: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    pub worktree_id: Option<String>,
+    pub branch_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,20 +229,22 @@ impl AgentRegistry {
     pub(crate) async fn create(&self, req: CreateAgentRequest, default_working_dir: &str) -> AgentSnapshot {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_ts();
+        let working_dir = req.working_dir.unwrap_or_else(|| default_working_dir.to_string());
+        let branch_name = req.branch_name.or_else(|| detect_branch_from_dir(&working_dir));
         let agent = AgentSnapshot {
             id: id.clone(),
             name: req.name.unwrap_or_else(|| format!("agent-{}", &id[..8])),
             status: AgentStatus::Created,
             provider: req.provider,
-            working_dir: req.working_dir.unwrap_or_else(|| default_working_dir.to_string()),
+            working_dir,
             session_id: req.session_id,
             created_at: now,
             updated_at: now,
             last_event_seq: 0,
             summary: None,
             last_error: None,
-            worktree_id: None,
-            branch_name: None,
+            worktree_id: req.worktree_id,
+            branch_name,
             parent_agent_id: None,
             pending_input: req.initial_input,
         };
@@ -396,11 +400,15 @@ impl AgentRegistry {
                 tokens.remove(&agent_id_for_cleanup);
             });
 
-            let working_dir = match {
+            let (working_dir, _worktree_id) = match {
                 let s = store.read().await;
-                s.get(&agent_id).map(|a| a.working_dir.clone())
+                s.get(&agent_id).map(|a| (a.working_dir.clone(), a.worktree_id.clone()))
             } {
-                Some(d) => d,
+                Some((d, wt)) => {
+                    let resolved = wt.as_ref()
+                        .and_then(|wt_id| resolve_worktree_path(&d, wt_id));
+                    (resolved.unwrap_or(d), wt)
+                }
                 None => {
                     set_status(&store, &agent_id, AgentStatus::Failed);
                     append_event(&event_store, &agent_id, "status_changed", Some(serde_json::json!({"status": "failed", "error": "agent not found"})));
@@ -539,6 +547,49 @@ fn extract_message_from_payload(payload: &Option<serde_json::Value>) -> Option<S
                         return Some(s.to_string());
                     }
                 }
+            }
+        }
+    }
+    None
+}
+
+fn detect_branch_from_dir(dir: &str) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn resolve_worktree_path(repo_dir: &str, branch: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut current_path: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current_path = Some(p.to_string());
+            current_branch = None;
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            current_branch = Some(b.trim_start_matches("refs/heads/").to_string());
+        }
+        if let (Some(ref p), Some(ref b)) = (&current_path, &current_branch) {
+            if b == branch {
+                return Some(p.clone());
             }
         }
     }
@@ -924,6 +975,8 @@ mod tests {
             session_id: None,
             initial_input: None,
             metadata: None,
+            worktree_id: None,
+            branch_name: None,
         };
         let agent = registry.create(req, "/tmp").await;
         assert_eq!(agent.status, AgentStatus::Created);
@@ -940,6 +993,8 @@ mod tests {
             session_id: None,
             initial_input: None,
             metadata: None,
+            worktree_id: None,
+            branch_name: None,
         };
         let agent = registry.create(req, "/tmp").await;
 
@@ -966,6 +1021,8 @@ mod tests {
             session_id: None,
             initial_input: None,
             metadata: None,
+            worktree_id: None,
+            branch_name: None,
         };
         let agent = registry.create(req, "/tmp").await;
 
@@ -994,6 +1051,8 @@ mod tests {
             session_id: None,
             initial_input: None,
             metadata: None,
+            worktree_id: None,
+            branch_name: None,
         };
         let agent = registry.create(req, "/tmp").await;
 
@@ -1017,6 +1076,8 @@ mod tests {
             session_id: None,
             initial_input: None,
             metadata: None,
+            worktree_id: None,
+            branch_name: None,
         };
         let agent = registry.create(req, "/tmp").await;
 
@@ -1041,5 +1102,42 @@ mod tests {
         assert_eq!(resp.items[0].seq, 4);
         assert_eq!(resp.items[1].seq, 5);
         assert!(!resp.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_create_agent_with_worktree_and_branch() {
+        let registry = AgentRegistry::new();
+        let req = CreateAgentRequest {
+            name: Some("wt-agent".to_string()),
+            provider: None,
+            working_dir: None,
+            session_id: None,
+            initial_input: None,
+            metadata: None,
+            worktree_id: Some("feature-x".to_string()),
+            branch_name: Some("feature-x".to_string()),
+        };
+        let agent = registry.create(req, "/tmp").await;
+        assert_eq!(agent.worktree_id, Some("feature-x".to_string()));
+        assert_eq!(agent.branch_name, Some("feature-x".to_string()));
+        assert_eq!(agent.status, AgentStatus::Created);
+    }
+
+    #[tokio::test]
+    async fn test_auto_detect_branch_allows_none_outside_repo() {
+        let registry = AgentRegistry::new();
+        let req = CreateAgentRequest {
+            name: None,
+            provider: None,
+            working_dir: Some("/tmp".to_string()),
+            session_id: None,
+            initial_input: None,
+            metadata: None,
+            worktree_id: None,
+            branch_name: None,
+        };
+        let agent = registry.create(req, "/tmp").await;
+        assert_eq!(agent.worktree_id, None);
+        // branch_name may be None or a branch name depending on CWD
     }
 }

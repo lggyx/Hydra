@@ -2054,7 +2054,13 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
             }
         }
         [sub] if sub.eq_ignore_ascii_case("new") || sub.eq_ignore_ascii_case("create") => {
-            let payload = serde_json::json!({});
+            let mut payload = serde_json::json!({});
+            if let Some(worktree) = parse_arg(arg, &["--worktree", "-w"]) {
+                payload["worktree_id"] = serde_json::json!(worktree);
+            }
+            if let Some(branch) = parse_arg(arg, &["--branch", "-b"]) {
+                payload["branch_name"] = serde_json::json!(branch);
+            }
             match agents_post("/api/v1/agents", &payload) {
                 Ok(body) => {
                     let parsed: serde_json::Value =
@@ -2227,7 +2233,7 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
         }
         _ => {
             renderer.render(UiLine::CommandOutput(
-                "  Usage: /agents, /agents <id>, /agents <id> start|cancel|events, /agents <id> input <text>, /agents new|create\n"
+                "  Usage: /agents, /agents <id>, /agents <id> start|cancel|events, /agents <id> input <text>, /agents new|create [--worktree <id>] [--branch <name>]\n"
                     .to_string(),
             ));
         }
@@ -2338,6 +2344,16 @@ fn spawn_agent_poll(id: &str, poll_tx: &tokio::sync::mpsc::UnboundedSender<Agent
             }
         }
     });
+}
+
+fn parse_arg<'a>(input: &str, flags: &[&str]) -> Option<String> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    for (i, part) in parts.iter().enumerate() {
+        if flags.contains(part) {
+            return parts.get(i + 1).map(|v| v.to_string());
+        }
+    }
+    None
 }
 
 /// Detect the current branch name in a directory.
