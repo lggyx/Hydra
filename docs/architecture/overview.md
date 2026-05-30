@@ -650,7 +650,6 @@ Agent → ResourceManager:
   AgentEvent::Decision { decisions: Vec<HarnessCommand> }
   AgentEvent::TaskSpawned { child_id, desc }
   AgentEvent::ReviewResult { score, verdict }
-  AgentEvent::Subscribe (agent requests event feed)
 ```
 
 ### 9.2 ExecutionAgent ↔ ToolRegistry
@@ -731,7 +730,7 @@ Adapter layer (hydra-workspace/src/adapter.rs):
 | Orphaned worktrees | GC on cleanup | ISO-Framework::gc() |
 | Network failure (LLM) | Retry with backoff, then kill | TurnRunner retry logic (from atomcode) |
 | Git merge conflict | Agent killed, conflict preserved | ISO-Framework conflict detection |
-| ResourceManager panic | Agents continue running (they own their event_rx) | Agents don't depend on ResourceManager after spawn |
+| ResourceManager panic | Agents continue running (they hold event_tx sender) | Agents send events via sender; RM owns event_rx but agents don't depend on RM after spawn |
 
 ---
 

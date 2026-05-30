@@ -292,6 +292,7 @@ flowchart LR
     end
 
     subgraph "ResourceManager"
+        RM_RX["event_rx"]
         BUS["EventBus"]
         REG["AgentRegistry"]
     end
@@ -310,7 +311,8 @@ flowchart LR
         UI_RX["event_rx"]
     end
 
-    A_TX -->|AgentEvent| BUS
+    A_TX -->|AgentEvent| RM_RX
+    RM_RX --> BUS
     BUS --> B_RX
     BUS --> C_RX
     BUS --> UI_RX
