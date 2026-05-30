@@ -231,50 +231,44 @@ Replace the placeholder `WorkspaceManager` in ResourceManager with `HydraWorkspa
 use hydra_workspace::HydraWorkspaceManager;
 
 pub struct ResourceManager {
-    agents: Arc<RwLock<AgentRegistry>>,
-    event_bus: mpsc::UnboundedSender<AgentEvent>,
-    subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<AgentEvent>>>>,
-    next_id: AtomicU64,
-    git: Arc<HydraWorkspaceManager>,        // ← ISO-Framework backed
-    providers: Arc<RwLock<ProviderRegistry>>,
-    tool_registry: Arc<RwLock<ToolRegistry>>,
+    agents:          Arc<RwLock<AgentRegistry>>,
+    event_rx:        mpsc::UnboundedReceiver<AgentEvent>,
+    event_bus:       mpsc::UnboundedSender<AgentEvent>,   // cloned from event_rx half
+    subscribers:     Arc<RwLock<Vec<mpsc::UnboundedSender<AgentEvent>>>>,
+    control_senders: Arc<RwLock<HashMap<AgentId, mpsc::UnboundedSender<AgentCommand>>>>,
+    next_id:         AtomicU64,
+    git:             Arc<dyn GitWorktreeManager>,          // trait object, mockable
+    providers:       Arc<RwLock<ProviderRegistry>>,
+    tool_registry:   Arc<RwLock<ToolRegistry>>,
 }
 
 impl ResourceManager {
     pub fn spawn(&self, kind: AgentKind, spec: AgentSpec) -> Result<AgentHandle> {
         let id = AgentId(self.next_id.fetch_add(1, Ordering::SeqCst));
 
-        match kind {
-            AgentKind::Execution => {
-                let branch = format!("hydra/agent/{}", id.0);
-                let worktree = self.git.create_for_agent(id, "main")?;
+        // Build ResourceHandle (agent owns its channels)
+        let handle = self.build_handle(id, kind, spec)?;
 
-                let agent = ExecutionAgent::new(id, branch, worktree, spec, self.clone())?;
-                self.agents.write().unwrap().register(id, agent);
-            }
-            AgentKind::Orchestrator => {
-                let agent = OrchestratorAgent::new(id, self.clone())?;
-                self.agents.write().unwrap().register(id, agent);
-            }
-            AgentKind::Reviewer => {
-                let branch = spec.branch.clone().unwrap();
-                let worktree = self.git.create_worktree_for_branch(&branch)?;
-                let agent = ReviewerAgent::new(id, branch, worktree, spec, self.clone())?;
-                self.agents.write().unwrap().register(id, agent);
-            }
-        }
+        // Register control sender so send_command can route to this agent
+        self.control_senders.write().unwrap().insert(id, handle.control_tx.clone());
 
-        // Spawn agent's run() loop
-        let handle = self.agents.read().unwrap().get(id).unwrap().clone_box();
-        let resources = self.clone();
+        // Spawn agent's run loop
         let event_tx = self.event_bus.clone();
         tokio::spawn(async move {
-            let mut agent = handle;
-            let outcome = agent.run(&resources).await;
+            let mut agent = handle.agent;
+            let outcome = agent.run(handle.resources).await;
             event_tx.send(AgentEvent::Completed { agent_id: id, outcome }).ok();
         });
 
         Ok(AgentHandle { id, state: /* ... */ })
+    }
+
+    pub fn send_command(&self, id: AgentId, cmd: AgentCommand) -> Result<()> {
+        let senders = self.control_senders.read().unwrap();
+        senders.get(&id)
+            .ok_or_anyhow!("agent {} not found or terminated", id)?
+            .send(cmd)
+            .map_err(|_| anyhow!("agent {} control channel closed", id))
     }
 }
 ```

@@ -25,7 +25,7 @@ This directory contains the complete architecture design for Hydra — a Rust-ba
 
 ### For integrators (VSCode, Dashboard, CLI)
 1. Read [overview.md § Interface Contracts § StateServer ↔ Clients](./overview.md#94-stateserver--clients) for the REST/WS API
-2. Read [diagrams.md § Layered Communication Model](./diagrams.md#8-layered-communication-model-mermaid) for the 5-layer architecture
+2. Read [diagrams.md § Layered Communication Model](./diagrams.md#8-layered-communication-model) for the 5-layer architecture
 
 ## Key Decisions
 

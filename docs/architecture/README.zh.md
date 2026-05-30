@@ -25,7 +25,7 @@
 
 ### 面向集成者（VSCode、Dashboard、CLI）
 1. 阅读 [overview.zh.md § 接口契约 § StateServer ↔ 客户端](./overview.zh.md#94-stateserver--客户端) 了解 REST/WS API
-2. 查看 [diagrams.zh.md § 分层通信模型](./diagrams.zh.md#8-分层通信模型mermaid) 理解 5 层架构
+2. 查看 [diagrams.zh.md § 分层通信模型](./diagrams.zh.md#8-分层通信模型) 理解 5 层架构
 
 ## 关键决策
 

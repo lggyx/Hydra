@@ -21,38 +21,38 @@
 ## 2. 系统拓扑
 
 ```
-                         ┌──────────────────────┐
-                         │     ResourceManager    │  ← 纯资源路由器
-                         │  (分支 / worktree /   │
-                         │   ID / 事件扇出)       │
-                         └──────────┬───────────┘
-                                    │
-              ┌─────────┬──────────┼──────────┬─────────┐
-              │ spawn   │ send_    │ subscribe │  gc /   │
-              │ agent   │ command  │  events   │ cleanup │
-              ▼         ▼          ▼           ▼         ▼
-         ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
-         │Agent #1│ │Agent #2│ │Agent #3│ │Agent #4│ │Agent #5│ ...
-         │执行者  │ │执行者  │ │编排者  │ │审查者  │ │自定义  │
-         └───┬────┘ └───┬────┘ └───┬────┘ └───┬────┘ └───┬────┘
-             │          │          │          │          │
-             │  AgentEvent (广播)    │          │
-             └──────────┬─────────────────┘          │
-                        │                            │
-                        ▼                            │
-              ┌─────────────────────┐               │
-              │   事件订阅者          │               │
-              │  TUI │ REST │ WS    │               │
-              │  CLI │ VSCode │ ... │               │
-              └─────────────────────┘               │
-                                                      │
-                                    ┌─────────────────┘
-                                    ▼
-                         ┌──────────────────────┐
-                         │   GitWorktreeSafety   │  ← 来自 ISO-Framework
-                         │  (创建 / 删除 /       │
-                         │   GC / 冲突保护)       │
-                         └──────────────────────┘
+                          ┌──────────────────────┐
+                          │     ResourceManager    │  ← 纯资源路由器
+                          │  (分支 / worktree /   │
+                          │   ID / 事件扇出)       │
+                          └──────────┬───────────┘
+                                     │
+               ┌─────────┬──────────┼──────────┬─────────┐
+               │ spawn   │ send_    │ subscribe │  gc /   │
+               │ agent   │ command  │  events   │ cleanup │
+               ▼         ▼          ▼           ▼         ▼
+          ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+          │Agent #1│ │Agent #2│ │Agent #3│ │Agent #4│ │Agent #5│ ...
+          │执行者  │ │执行者  │ │编排者  │ │审查者  │ │自定义  │
+          └───┬────┘ └───┬────┘ └───┬────┘ └───┬────┘ └───┬────┘
+              │          │          │          │          │
+              │  AgentEvent (广播)    │          │
+              └──────────┬─────────────────┘          │
+                         │                            │
+                         ▼                            │
+               ┌─────────────────────┐               │
+               │   事件订阅者          │               │
+               │  TUI │ REST │ WS    │               │
+               │  CLI │ VSCode │ ... │               │
+               └─────────────────────┘               │
+                                                       │
+                                     ┌─────────────────┘
+                                     ▼
+                          ┌──────────────────────┐
+                          │   GitWorktreeSafety   │  ← 来自 ISO-Framework
+                          │  (创建 / 删除 /       │
+                          │   GC / 冲突保护)       │
+                          └──────────────────────┘
 ```
 
 ---
@@ -83,7 +83,83 @@ pub trait Agent: Send + Sync {
 
 **设计理由**: 单一 trait 消除了"Orchestrator 是特殊的"反模式。任何新的 Agent 类型（Tester、Deployer、Reviewer）都可以直接接入，无需修改 ResourceManager。
 
-### 3.2 AgentId 和 AgentKind
+### 3.2 LlmProvider（trait 抽象）
+
+所有 LLM 后端的抽象。实现：OpenAI、Anthropic、Ollama 等。
+
+```rust
+/// 所有 LLM 后端的抽象。实现：OpenAI、Anthropic、Ollama 等。
+#[async_trait]
+pub trait LlmProvider: Send + Sync {
+    /// 发送补全请求。返回模型的原始文本响应。
+    async fn complete(&self, req: CompletionRequest) -> anyhow::Result<CompletionResponse>;
+
+    /// 流式输出补全 token（用于实时 UI 更新）。可选。
+    async fn stream(&self, req: CompletionRequest) -> anyhow::Result<impl Stream<Item = String>>;
+}
+
+pub struct CompletionRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    pub temperature: f32,
+    pub max_tokens: usize,
+    pub tools: Vec<ToolDef>,          // 可选，用于 function calling
+    pub tool_choice: ToolChoice,
+}
+
+pub struct CompletionResponse {
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: TokenUsage,
+}
+```
+
+**Mock 示例**:
+```rust
+struct FakeProvider;
+#[async_trait]
+impl LlmProvider for FakeProvider {
+    async fn complete(&self, _req: CompletionRequest) -> anyhow::Result<CompletionResponse> {
+        Ok(CompletionResponse { content: "mocked".into(), tool_calls: vec![], usage: Default::default() })
+    }
+}
+```
+
+### 3.3 GitWorktreeManager（trait 抽象）
+
+Git worktree 生命周期的抽象。默认实现：ISO-Framework 适配层。
+
+```rust
+/// Git worktree 生命周期的抽象。默认：ISO-Framework 适配层。
+#[async_trait]
+pub trait GitWorktreeManager: Send + Sync {
+    async fn create(&self, branch: &str, path: &Path, base: &str) -> anyhow::Result<WorktreeHandle>;
+    async fn delete(&self, handle: &WorktreeHandle) -> anyhow::Result<()>;
+    async fn list(&self) -> anyhow::Result<Vec<WorktreeInfo>>;
+    async fn gc(&self) -> anyhow::Result<GcReport>;
+}
+
+pub struct WorktreeHandle {
+    pub branch: String,
+    pub path: PathBuf,
+}
+```
+
+**Mock 示例**:
+```rust
+struct FakeGit;
+#[async_trait]
+impl GitWorktreeManager for FakeGit {
+    async fn create(&self, _b: &str, _p: &Path, _base: &str) -> anyhow::Result<WorktreeHandle> {
+        Ok(WorktreeHandle { branch: "main".into(), path: PathBuf::from("/tmp/fake") })
+    }
+    async fn delete(&self, _h: &WorktreeHandle) -> anyhow::Result<()> { Ok(()) }
+    async fn list(&self) -> anyhow::Result<Vec<WorktreeInfo>> { Ok(vec![]) }
+    async fn gc(&self) -> anyhow::Result<GcReport> { Ok(GcReport { reclaimed: 0 }) }
+}
+```
+
+### 3.4 AgentId 和 AgentKind
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -98,7 +174,7 @@ pub enum AgentKind {
 }
 ```
 
-### 3.3 AgentState（共享、可观测）
+### 3.5 AgentState（共享、可观测）
 
 ```rust
 #[derive(Debug, Clone, Serialize)]
@@ -123,7 +199,7 @@ pub enum AgentStatus {
 
 `AgentState` 存储在 ResourceManager 的 `Arc<RwLock<>>` 中。订阅者读取快照；绝不持有可变引用。
 
-### 3.4 AgentEvent（统一事件流）
+### 3.6 AgentEvent（统一事件流）
 
 ```rust
 #[derive(Debug, Clone, Serialize)]
@@ -147,7 +223,7 @@ pub enum AgentEvent {
 }
 ```
 
-### 3.5 AgentCommand（控制接口）
+### 3.7 AgentCommand（控制接口）
 
 ```rust
 #[derive(Debug, Clone, Serialize)]
@@ -170,7 +246,7 @@ pub enum AgentCommand {
 }
 ```
 
-### 3.6 AgentOutcome（run() 返回值）
+### 3.8 AgentOutcome（run() 返回值）
 
 ```rust
 #[derive(Debug, Clone, Serialize)]
@@ -326,34 +402,34 @@ pub struct ReviewerAgent {
                                           │   (扇出到所有      │
                                           │    订阅者)         │
                                           └────────┬─────────┘
-                                                   │
-                      ┌────────────────────────────┼────────────────────────┐
-                      │                            │                        │
-                      ▼                            ▼                        ▼
-               ┌──────────────┐          ┌──────────────────┐      ┌──────────────┐
-               │ Orchestrator  │          │   REST Server     │      │  TUI / CLI    │
-               │ Agent         │          │   (daemon)        │      │               │
-               │               │          │                   │      │               │
-               │ 通过 event_rx  │          │ 向 VSCode 扩展 +  │      │ 在终端显示    │
-               │ 接收所有事件   │          │ Web Dashboard     │      │ worker 状态   │
-               └───────┬───────┘          └──────────────────┘      └──────────────┘
-                       │
-                       │  决策：kill #2，promote #1
-                       │
-                       ▼
-               ┌──────────────┐
-               │ send_command  │
-               │ (通过 Resource │
-               │  Manager)     │
-               └───────┬───────┘
-                       │
-                       ▼
-               ┌──────────────┐
-               │  Resource     │
-               │  Manager      │
-               │  路由到目标    │
-               │  Agent        │
-               └──────────────┘
+                                                 │
+                       ┌────────────────────────────┼────────────────────────┐
+                       │                            │                        │
+                       ▼                            ▼                        ▼
+                ┌──────────────┐          ┌──────────────────┐      ┌──────────────┐
+                │ Orchestrator  │          │   REST Server     │      │  TUI / CLI    │
+                │ Agent         │          │   (daemon)        │      │               │
+                │               │          │                   │      │               │
+                │ 通过 event_rx  │          │ 向 VSCode 扩展 +  │      │ 在终端显示    │
+                │ 接收所有事件   │          │ Web Dashboard     │      │ worker 状态   │
+                └───────┬───────┘          └──────────────────┘      └──────────────┘
+                        │
+                        │  决策：kill #2，promote #1
+                        │
+                        ▼
+                ┌──────────────┐
+                │ send_command  │
+                │ (通过 Resource │
+                │  Manager)     │
+                └───────┬───────┘
+                        │
+                        ▼
+                ┌──────────────┐
+                │  Resource     │
+                │  Manager      │
+                │  路由到目标    │
+                │  Agent        │
+                └──────────────┘
 ```
 
 **关键不变式**：事件流是**单向广播**。没有任何 Agent 持有另一个 Agent 的 event_rx。ResourceManager 持有所有 receiver 并负责扇出。Agent 只持有 `event_tx`（sender）。
@@ -482,7 +558,7 @@ dashboard (WS) ─────────────┤
         hydra-workspace  providers/   tools/
         (ISO-Framework   (OpenAI/     (edit/bash/
          fork)            Anthropic/   read/...)
-                           Ollama)
+                            Ollama)
 ```
 
 **规则**：hydra-core 不依赖任何上层 crate。所有其他 crate 依赖 hydra-core。  

@@ -762,7 +762,7 @@ iso_code::Manager::create(branch, path, options)
   │  返回
   ▼
 <span class="text-gray">// 7. ResourceManager 创建 ExecutionAgent，spawn 异步任务</span>
-tokio::spawn(agent.run(&resources))
+tokio::spawn(agent.run(resources))
   │
   ▼
 <span class="text-gray">// 8. ExecutionAgent 内部循环：LLM + Tool</span>

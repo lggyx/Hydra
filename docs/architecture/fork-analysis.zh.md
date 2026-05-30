@@ -319,22 +319,26 @@ Fork 前需要理解的关键文件：
 
 ---
 
-## 6. 替代方案：不 Fork，Vendor
+## 6. Fork 的维护模型
 
-如果 ISO-Framework 足够小（< 2000 行），考虑 vendoring 而非 fork：
+由于 Hydra 直接将 ISO-Framework fork 到 `crates/hydra-workspace/`，后续维护遵循以下模式：
 
+| 活动 | 频率 | 负责人 |
+|----------|---------|-------|
+| 同步上游 bug 修复 | 每月 | 核心维护者 |
+| 审阅上游 PR | 每周 | 核心维护者 |
+| 更新适配层 | 按需（当 ISO-Framework API 变更时） | 核心维护者 |
+| Hydra 专属安全策略 | 持续 | Hydra 团队 |
+
+```bash
+# 每月同步流程
+cd crates/hydra-workspace/
+git fetch upstream
+git log upstream/main..HEAD --oneline  # 审阅我们的本地补丁
+git merge upstream/main                 # 合并上游修复
+cargo test                              # 验证没有破坏
 ```
-crates/hydra-workspace/
-├── Cargo.toml
-└── src/
-    ├── lib.rs          # HydraWorkspaceManager（我们的代码）
-    ├── vendor/
-    │   ├── mod.rs      # 从 vendored ISO-Framework re-export
-    │   ├── manager.rs  # 从 ISO-Framework 复制
-    │   └── ...
-```
 
-**优点**: 无外部依赖、完全控制、Cargo.toml 更简单。  
-**缺点**: 没有上游 bug 修复、改进需要手动合并。  
+**理由**: ISO-Framework 规模小（估计约 2000 行），专为 AI Agent worktree 安全设计，且积极维护。Fork 既给予了对安全策略的完全控制权，又保留了拉取上游 bug 修复的能力。Vendoring 会 forfeit upstream improvements 并在后期增加合并摩擦。
 
-**建议**: 从 vendoring 开始。如果 ISO-Framework 积极维护且我们想要它们的修复，切换到 fork + submodule。
+**许可证说明**: ISO-Framework 采用 MIT/Apache-2.0 双许可证 —— 与 Hydra 的许可证兼容。Fork 没有法律障碍。
