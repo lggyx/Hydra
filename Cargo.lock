@@ -1138,6 +1138,7 @@ dependencies = [
  "hydra-core",
  "hydra-telemetry",
  "regex",
+ "scopeguard",
  "serde",
  "serde_json",
  "serial_test",

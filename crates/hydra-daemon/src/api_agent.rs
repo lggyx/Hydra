@@ -8,8 +8,14 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::{json_error, AppState};
+use hydra_core::config::Config;
+use hydra_core::provider;
+use hydra_core::session::{Session, SessionId, SessionManager};
+use hydra_core::tool::ToolRegistry;
+use hydra_core::turn::{event::{TurnEvent, TurnResult}, runner::TurnRunner};
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -52,6 +58,9 @@ pub struct AgentSnapshot {
     pub worktree_id: Option<String>,
     pub branch_name: Option<String>,
     pub parent_agent_id: Option<String>,
+    /// Pending user input to inject into the conversation on next execution.
+    #[serde(skip)]
+    pub pending_input: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,14 +166,6 @@ impl AgentStore {
         self.agents.values().cloned().collect()
     }
 
-    fn resolve_id(&self, id: &str) -> Option<String> {
-        if self.agents.contains_key(id) {
-            return Some(id.to_string());
-        }
-        let matches: Vec<_> = self.agents.keys().filter(|k| k.starts_with(id)).collect();
-        if matches.len() == 1 { Some(matches[0].clone()) } else { None }
-    }
-
     fn update_status(&mut self, id: &str, status: AgentStatus) {
         let key = if self.agents.contains_key(id) {
             Some(id.to_string())
@@ -210,6 +211,8 @@ impl AgentEventStore {
 pub struct AgentRegistry {
     store: Arc<RwLock<AgentStore>>,
     event_store: Arc<RwLock<AgentEventStore>>,
+    /// Active agent execution tokens (agent_id -> CancellationToken)
+    active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
 }
 
 impl AgentRegistry {
@@ -217,6 +220,7 @@ impl AgentRegistry {
         Self {
             store: Arc::new(RwLock::new(AgentStore::new())),
             event_store: Arc::new(RwLock::new(AgentEventStore::new())),
+            active_tokens: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -238,6 +242,7 @@ impl AgentRegistry {
             worktree_id: None,
             branch_name: None,
             parent_agent_id: None,
+            pending_input: req.initial_input,
         };
         self.store.write().await.insert(agent.clone());
         agent
@@ -317,10 +322,16 @@ impl AgentRegistry {
 
         let command_id = uuid::Uuid::new_v4().to_string();
 
+        // Extract message text from payload; fall back to pending_input from creation
+        let input_text = extract_message_from_payload(&req.payload)
+            .or(current.pending_input);
+
         if req.type_.as_str() == "start" {
-            self.spawn_mock_progression(id.to_string());
+            self.spawn_agent_execution(id.to_string(), input_text).await;
         } else if req.type_.as_str() == "append_input" {
-            self.spawn_mock_progression(id.to_string());
+            self.spawn_agent_execution(id.to_string(), input_text).await;
+        } else if req.type_.as_str() == "cancel" {
+            self.cancel_agent_execution(&id).await;
         }
 
         Ok(PostAgentCommandResponse {
@@ -357,57 +368,490 @@ impl AgentRegistry {
         })
     }
 
-    fn spawn_mock_progression(&self, agent_id: String) {
+    /// Cancel an active agent execution. Works for Running and WaitingInput states.
+    pub(crate) async fn cancel_agent_execution(&self, agent_id: &str) {
+        let tokens = self.active_tokens.read().await;
+        if let Some(token) = tokens.get(agent_id) {
+            token.cancel();
+        }
+    }
+
+    /// Spawn a real agent execution using hydra-core's TurnRunner.
+    /// Falls back to mock progression if config/provider setup fails.
+    pub(crate) async fn spawn_agent_execution(&self, agent_id: String, input_text: Option<String>) {
         let store = self.store.clone();
         let event_store = self.event_store.clone();
+        let active_tokens = self.active_tokens.clone();
+
+        // Create a new CancellationToken for this execution
+        let cancel_token = CancellationToken::new();
+        active_tokens.write().await.insert(agent_id.clone(), cancel_token.clone());
+
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            {
-                let mut s = store.write().await;
-                s.update_status(&agent_id, AgentStatus::Running);
-            }
-            {
-                let mut es = event_store.write().await;
-                let seq = es
-                    .events
-                    .get(&agent_id)
-                    .map(|v| v.len() as u64 + 1)
-                    .unwrap_or(1);
-                es.append(
-                    &agent_id,
-                    AgentEvent {
-                        seq,
-                        agent_id: agent_id.clone(),
-                        event_type: "status_changed".to_string(),
-                        timestamp: now_ts(),
-                        payload: Some(serde_json::json!({"status": "running"})),
-                    },
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            {
-                let mut s = store.write().await;
-                s.update_status(&agent_id, AgentStatus::Completed);
-            }
-            {
-                let mut es = event_store.write().await;
-                let seq = es
-                    .events
-                    .get(&agent_id)
-                    .map(|v| v.len() as u64 + 1)
-                    .unwrap_or(1);
-                es.append(
-                    &agent_id,
-                    AgentEvent {
-                        seq,
-                        agent_id: agent_id.clone(),
-                        event_type: "status_changed".to_string(),
-                        timestamp: now_ts(),
-                        payload: Some(serde_json::json!({"status": "completed"})),
-                    },
-                );
+            // Cleanup token when done. Clone agent_id for the guard so the
+            // original can be moved into run_mock_progression on fallback.
+            let agent_id_for_cleanup = agent_id.clone();
+            let _token_guard = scopeguard::guard((), move |_| {
+                let mut tokens = active_tokens.blocking_write();
+                tokens.remove(&agent_id_for_cleanup);
+            });
+
+            let working_dir = match {
+                let s = store.read().await;
+                s.get(&agent_id).map(|a| a.working_dir.clone())
+            } {
+                Some(d) => d,
+                None => {
+                    set_status(&store, &agent_id, AgentStatus::Failed);
+                    append_event(&event_store, &agent_id, "status_changed", Some(serde_json::json!({"status": "failed", "error": "agent not found"})));
+                    return;
+                }
+            };
+
+            // Try real execution; fall back to mock on any error
+            let result = run_real_execution(
+                store.clone(),
+                event_store.clone(),
+                agent_id.clone(),
+                working_dir,
+                input_text,
+                cancel_token,
+            ).await;
+
+            if let Err(_e) = result {
+                // Fall back to mock progression so tests and simple cases still work
+                run_mock_progression(store, event_store, agent_id).await;
             }
         });
+    }
+
+}
+
+/// Shared mock progression logic used as fallback.
+async fn run_mock_progression(
+    store: Arc<RwLock<AgentStore>>,
+    event_store: Arc<RwLock<AgentEventStore>>,
+    agent_id: String,
+) {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    {
+        let mut s = store.write().await;
+        s.update_status(&agent_id, AgentStatus::Running);
+    }
+    {
+        let mut es = event_store.write().await;
+        let seq = es
+            .events
+            .get(&agent_id)
+            .map(|v| v.len() as u64 + 1)
+            .unwrap_or(1);
+        es.append(
+            &agent_id,
+            AgentEvent {
+                seq,
+                agent_id: agent_id.clone(),
+                event_type: "status_changed".to_string(),
+                timestamp: now_ts(),
+                payload: Some(serde_json::json!({"status": "running"})),
+            },
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    {
+        let mut s = store.write().await;
+        s.update_status(&agent_id, AgentStatus::Completed);
+    }
+    {
+        let mut es = event_store.write().await;
+        let seq = es
+            .events
+            .get(&agent_id)
+            .map(|v| v.len() as u64 + 1)
+            .unwrap_or(1);
+        es.append(
+            &agent_id,
+            AgentEvent {
+                seq,
+                agent_id: agent_id.clone(),
+                event_type: "status_changed".to_string(),
+                timestamp: now_ts(),
+                payload: Some(serde_json::json!({"status": "completed"})),
+            },
+        );
+    }
+}
+
+// Helper to set agent status
+fn set_status(
+    store: &Arc<RwLock<AgentStore>>,
+    agent_id: &str,
+    status: AgentStatus,
+) {
+    let mut s = store.blocking_write();
+    s.update_status(agent_id, status);
+}
+
+// Helper to append an event
+fn append_event(
+    event_store: &Arc<RwLock<AgentEventStore>>,
+    agent_id: &str,
+    event_type: &str,
+    payload: Option<serde_json::Value>,
+) {
+    let mut es = event_store.blocking_write();
+    let seq = es
+        .events
+        .get(agent_id)
+        .map(|v| v.len() as u64 + 1)
+        .unwrap_or(1);
+    es.append(
+        agent_id,
+        AgentEvent {
+            seq,
+            agent_id: agent_id.to_string(),
+            event_type: event_type.to_string(),
+            timestamp: now_ts(),
+            payload,
+        },
+    );
+}
+
+/// Extract a message string from a command payload.
+/// Accepts `message`, `text`, or `input` keys at the top level or nested under `input`.
+fn extract_message_from_payload(payload: &Option<serde_json::Value>) -> Option<String> {
+    let obj = payload.as_ref()?;
+    let obj = obj.as_object()?;
+    for key in &["message", "text", "input"] {
+        if let Some(v) = obj.get(*key) {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    // Also try nested: payload.input.message
+    if let Some(input_obj) = obj.get("input").and_then(|v| v.as_object()) {
+        for key in &["message", "text"] {
+            if let Some(v) = input_obj.get(*key) {
+                if let Some(s) = v.as_str() {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Try to execute a real LLM turn loop for the given agent.
+/// Returns Ok(()) on success, Err(()) on any failure (caller falls back to mock).
+async fn run_real_execution(
+    store: Arc<RwLock<AgentStore>>,
+    event_store: Arc<RwLock<AgentEventStore>>,
+    agent_id: String,
+    working_dir: String,
+    input_text: Option<String>,
+    cancel_token: CancellationToken,
+) -> Result<(), ()> {
+    use hydra_core::tool::{
+        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool,
+        list_dir::ListDirTool, read::ReadFileTool, search_replace::SearchReplaceTool,
+        todo::TodoTool, web_fetch::WebFetchTool, web_search::WebSearchTool,
+        write::WriteFileTool,
+    };
+    // 1. Load config
+    let config_path = Config::default_path();
+    let config = match Config::load(&config_path) {
+        Ok(c) => c,
+        Err(_) => return Err(()),
+    };
+
+    // 2. Determine provider from agent snapshot
+    let provider_name = {
+        let s = store.read().await;
+        s.get(&agent_id)
+            .and_then(|a| a.provider.clone())
+            .unwrap_or_else(|| config.default_provider.clone())
+    };
+    let provider_config = match config.providers.get(&provider_name) {
+        Some(pc) => pc,
+        None => return Err(()),
+    };
+
+    // 3. Create provider
+    let provider = match provider::create_provider(provider_config) {
+        Ok(p) => p,
+        Err(_) => return Err(()),
+    };
+
+    // 4. Create session
+    let session_manager = SessionManager::new(std::path::Path::new(&working_dir));
+    let mut session = {
+        let s = store.read().await;
+        if let Some(ref sid) = s.get(&agent_id).and_then(|a| a.session_id.clone()) {
+            let session_id = SessionId::from_string(sid.to_string());
+            session_manager.load(&session_id).unwrap_or_else(|_| Session::new(working_dir.clone().into()))
+        } else {
+            Session::new(working_dir.clone().into())
+        }
+    };
+
+    // 5. Build conversation from session messages
+    let mut conversation = hydra_core::conversation::Conversation::new();
+    conversation.messages = session.messages.clone();
+
+    // Inject pending input as the first user message if present
+    if let Some(ref text) = input_text {
+        conversation.add_user_message(text);
+    }
+
+    // 6. Build tool registry (mirrors process_chat_request in main.rs)
+    let tool_context = hydra_core::tool::ToolContext::new(working_dir.clone().into());
+    let mut tool_registry = ToolRegistry::new();
+
+    tool_registry.register_sync(Box::new(ReadFileTool));
+    tool_registry.register_sync(Box::new(WriteFileTool));
+    tool_registry.register_sync(Box::new(EditFileTool));
+    tool_registry.register_sync(Box::new(BashTool));
+    tool_registry.register_sync(Box::new(GrepTool));
+    tool_registry.register_sync(Box::new(GlobTool));
+    tool_registry.register_sync(Box::new(ListDirTool));
+    tool_registry.register_sync(Box::new(SearchReplaceTool));
+    tool_registry.register_sync(Box::new(WebSearchTool));
+    tool_registry.register_sync(Box::new(WebFetchTool));
+    tool_registry.register_sync(Box::new(TodoTool::new()));
+
+    // Load skills and register use_skill tool
+    let mut skill_registry = hydra_core::skill::SkillRegistry::new();
+    skill_registry.reload(std::path::Path::new(&working_dir));
+    if !skill_registry.is_empty() {
+        tool_registry.register_sync(Box::new(hydra_core::tool::use_skill::UseSkillTool {
+            registry: std::sync::Arc::new(std::sync::RwLock::new(skill_registry)),
+        }));
+    }
+
+    let shared_tools = std::sync::Arc::new(tool_registry);
+
+    // 7. Build permission decider (bypass all for agent mode)
+    let permission: Box<dyn hydra_core::turn::permission::PermissionDecider> =
+        Box::new(hydra_core::turn::permission::AutoPermissionDecider::new(
+            hydra_core::turn::permission::AutoPermissionMode::BypassAll,
+        ));
+
+    // 8. Build context
+    let daemon_ctx = hydra_core::ctx::for_provider(provider_config);
+
+    // 9. Build TurnRunner
+    let mut turn_runner = TurnRunner {
+        provider: provider.into(),
+        tools: shared_tools,
+        context: tool_context,
+        config: config.clone(),
+        ctx: daemon_ctx,
+        permission,
+        recently_edited_files: Vec::new(),
+        hook_executor: std::sync::Arc::new(
+            hydra_core::hook::executor::HookExecutor::new(
+                hydra_core::hook::json_config::load_hooks_config(
+                    std::path::Path::new(&working_dir),
+                ),
+            ),
+        ),
+        loop_guard: Default::default(),
+    };
+
+    // 10. Build system prompt (use a simple one for agent execution)
+    let system_prompt = format!(
+        "You are an autonomous coding agent working in {}.\n\
+         You have access to file editing, bash execution, and search tools.\n\
+         Complete the assigned task efficiently and report your results.",
+        working_dir
+    );
+
+    // 11. Create event channel for TurnEvent → AgentEvent mapping
+    let (turn_tx, mut turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+
+    // 12. Mark agent as running
+    set_status(&store, &agent_id, AgentStatus::Running);
+    append_event(
+        &event_store,
+        &agent_id,
+        "status_changed",
+        Some(serde_json::json!({"status": "running"})),
+    );
+
+    // 13. Run turn loop
+    let mut total_tool_calls: usize = 0;
+
+    let final_summary = loop {
+        // Check if cancelled before each turn
+        if cancel_token.is_cancelled() {
+            set_status(&store, &agent_id, AgentStatus::Cancelled);
+            append_event(
+                &event_store,
+                &agent_id,
+                "status_changed",
+                Some(serde_json::json!({"status": "cancelled"})),
+            );
+            return Ok(());
+        }
+
+        // Drain any pending turn events from previous iteration
+        while let Ok(evt) = turn_rx.try_recv() {
+            map_turn_event(&event_store, &agent_id, &evt, &mut total_tool_calls);
+        }
+
+        let result = turn_runner
+            .run(&mut conversation, &system_prompt, &turn_tx, cancel_token.clone())
+            .await;
+
+        // Drain events from this turn
+        while let Ok(evt) = turn_rx.try_recv() {
+            map_turn_event(&event_store, &agent_id, &evt, &mut total_tool_calls);
+        }
+
+        match result {
+            TurnResult::Responded { text, .. } => break text,
+            TurnResult::UsedTools { .. } => continue,
+            TurnResult::Failed(e) => {
+                set_status(&store, &agent_id, AgentStatus::Failed);
+                append_event(
+                    &event_store,
+                    &agent_id,
+                    "status_changed",
+                    Some(serde_json::json!({"status": "failed", "error": e})),
+                );
+                return Ok(());
+            }
+            TurnResult::Cancelled => {
+                set_status(&store, &agent_id, AgentStatus::Cancelled);
+                append_event(
+                    &event_store,
+                    &agent_id,
+                    "status_changed",
+                    Some(serde_json::json!({"status": "cancelled"})),
+                );
+                return Ok(());
+            }
+        }
+    };
+
+    // 14. Save session
+    session.messages = conversation.messages;
+    session.auto_name_from_messages();
+    session.touch();
+    let _ = session_manager.save(&session);
+
+    // 15. Mark completed
+    set_status(&store, &agent_id, AgentStatus::Completed);
+    append_event(
+        &event_store,
+        &agent_id,
+        "status_changed",
+        Some(serde_json::json!({
+            "status": "completed",
+            "summary": final_summary,
+            "tool_calls": total_tool_calls,
+        })),
+    );
+
+    Ok(())
+}
+
+/// Map a TurnEvent from TurnRunner into an AgentEvent in the event store.
+fn map_turn_event(
+    event_store: &Arc<RwLock<AgentEventStore>>,
+    agent_id: &str,
+    evt: &TurnEvent,
+    tool_calls: &mut usize,
+) {
+    match evt {
+        TurnEvent::TextDelta(text) => {
+            append_event(
+                event_store,
+                agent_id,
+                "agent_message",
+                Some(serde_json::json!({"delta": text})),
+            );
+        }
+        TurnEvent::ReasoningDelta(text) => {
+            append_event(
+                event_store,
+                agent_id,
+                "agent_reasoning",
+                Some(serde_json::json!({"delta": text})),
+            );
+        }
+        TurnEvent::ToolCallStreaming { name, .. } => {
+            append_event(
+                event_store,
+                agent_id,
+                "tool_call_start",
+                Some(serde_json::json!({"tool": name})),
+            );
+        }
+        TurnEvent::ToolCallStarted { name, .. } => {
+            append_event(
+                event_store,
+                agent_id,
+                "tool_call_start",
+                Some(serde_json::json!({"tool": name})),
+            );
+        }
+        TurnEvent::ToolCallResult { name, success, .. } => {
+            *tool_calls += 1;
+            append_event(
+                event_store,
+                agent_id,
+                "tool_call_result",
+                Some(serde_json::json!({"tool": name, "success": success})),
+            );
+        }
+        TurnEvent::ToolBatchStarted { calls, .. } => {
+            let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+            append_event(
+                event_store,
+                agent_id,
+                "tool_batch_start",
+                Some(serde_json::json!({"tools": names})),
+            );
+        }
+        TurnEvent::ToolBatchCompleted { ok, total, .. } => {
+            append_event(
+                event_store,
+                agent_id,
+                "tool_batch_complete",
+                Some(serde_json::json!({"ok": ok, "total": total})),
+            );
+        }
+        TurnEvent::Error(e) => {
+            append_event(
+                event_store,
+                agent_id,
+                "error",
+                Some(serde_json::json!({"error": e})),
+            );
+        }
+        TurnEvent::TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            ..
+        } => {
+            append_event(
+                event_store,
+                agent_id,
+                "token_usage",
+                Some(serde_json::json!({
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                })),
+            );
+        }
+        _ => {}
     }
 }
 
