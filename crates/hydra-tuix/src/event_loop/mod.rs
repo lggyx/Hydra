@@ -46,6 +46,21 @@ use crate::render::{Renderer, UiLine};
 use crate::state::{UiPhase, UiState};
 use crate::think::ThinkStripper;
 
+#[derive(Debug)]
+pub enum AgentPollEvent {
+    StatusChanged {
+        agent_id: String,
+        old_status: String,
+        new_status: String,
+    },
+    PollFinished {
+        agent_id: String,
+    },
+    WaitingInput {
+        agent_id: String,
+    },
+}
+
 /// Encode raw RGBA pixel data as a PNG image in memory.
 fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
@@ -830,6 +845,8 @@ pub struct LoopCtx {
     /// run interactive multi-step flows, so first-run falls through to
     /// the existing "no provider configured" status hint.
     pub is_plain_renderer: bool,
+    pub agent_poll_tx: mpsc::UnboundedSender<AgentPollEvent>,
+    pub agent_poll_rx: mpsc::UnboundedReceiver<AgentPollEvent>,
 }
 
 /// Memoised result of the most recent clipboard probe. The hash is a
@@ -3101,6 +3118,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 }
             }
 
+            // ── Agent daemon poll events ──
+            Some(ev) = ctx.agent_poll_rx.recv() => {
+                handle_agent_poll_event(ev, &mut app, &ctx, renderer);
+            }
+
             // ── Agent events ──
             // Consumed regardless of phase. Gating on Streaming missed
             // the TurnComplete that arrives *after* an Error event: the
@@ -3466,6 +3488,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 if matches!(app.state.phase, UiPhase::Idle) {
                     redraw_idle_plain(&app.buf, &app.state, &ctx, renderer);
                 }
+            }
+
+            // ── Agent daemon poll events ──
+            Some(ev) = ctx.agent_poll_rx.recv() => {
+                handle_agent_poll_event(ev, &mut app, &ctx, renderer);
             }
 
             // ── Agent events ──
@@ -4905,6 +4932,38 @@ pub(crate) fn sync_recalled_attachments(
                 .pending_recalled_attachments
                 .retain(|r| buf.text.contains(&format!("[Image #{}]", r.n)));
         }
+    }
+}
+
+fn handle_agent_poll_event(ev: AgentPollEvent, app: &mut App, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    match ev {
+        AgentPollEvent::StatusChanged { agent_id, old_status, new_status } => {
+            let short_id = &agent_id[..8.min(agent_id.len())];
+            renderer.render(UiLine::CommandOutput(format!(
+                "  agent-{}: {} → {}\n",
+                short_id, old_status, new_status
+            )));
+            renderer.flush();
+        }
+        AgentPollEvent::WaitingInput { agent_id } => {
+            let short_id = &agent_id[..8.min(agent_id.len())];
+            renderer.render(UiLine::CommandOutput(format!(
+                "  agent-{}: waiting for input. Use `/agents {} input <text>` to respond.\n",
+                short_id, short_id
+            )));
+            renderer.flush();
+        }
+        AgentPollEvent::PollFinished { agent_id } => {
+            let short_id = &agent_id[..8.min(agent_id.len())];
+            renderer.render(UiLine::CommandOutput(format!(
+                "  agent-{}: reached terminal state, polling stopped.\n",
+                short_id
+            )));
+            renderer.flush();
+        }
+    }
+    if matches!(app.state.phase, UiPhase::Idle) {
+        redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
     }
 }
 

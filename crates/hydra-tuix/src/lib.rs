@@ -527,6 +527,7 @@ pub async fn run(
     );
 
     let file_index_root = working_dir.clone();
+    let (agent_poll_tx, agent_poll_rx) = tokio::sync::mpsc::unbounded_channel();
     let ctx = LoopCtx {
         config,
         model_name,
@@ -581,6 +582,8 @@ pub async fn run(
             crate::event_loop::ClipboardCheckState::default(),
         )),
         is_plain_renderer,
+        agent_poll_tx: agent_poll_tx,
+        agent_poll_rx: agent_poll_rx,
     };
 
     // CodingPlan drift monitor — kick off a startup check if the current

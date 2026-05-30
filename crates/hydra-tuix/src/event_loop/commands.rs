@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use super::{bg_runtime, save_and_reload, LoopCtx};
+use super::{bg_runtime, save_and_reload, AgentPollEvent, LoopCtx};
 use crate::i18n::{t, Msg};
 use crate::modals::{DirPicker, IssueWizard, LanguagePicker, Modal, ModelPicker, ProviderWizard, SessionPicker};
 use crate::render::{Renderer, UiLine};
@@ -1327,7 +1327,7 @@ pub(super) fn execute_slash_command(
             handle_worktree(arg, ctx, renderer)?;
         }
         "agents" => {
-            handle_agents(arg, renderer);
+            handle_agents(arg, ctx, renderer);
         }
         "think" => {
             let sub = arg.trim().to_ascii_lowercase();
@@ -2011,7 +2011,7 @@ fn handle_worktree(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) ->
     Ok(())
 }
 
-fn handle_agents(arg: &str, renderer: &mut dyn Renderer) {
+fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
 
     match parts.as_slice() {
@@ -2127,6 +2127,9 @@ fn handle_agents(arg: &str, renderer: &mut dyn Renderer) {
                                     "  Command accepted: {} -> {}\n",
                                     before, after
                                 )));
+                                if action_lower == "start" {
+                                    spawn_agent_poll(id, &ctx.agent_poll_tx);
+                                }
                             }
                         }
                         Err(e) => {
@@ -2137,17 +2140,94 @@ fn handle_agents(arg: &str, renderer: &mut dyn Renderer) {
                         }
                     }
                 }
+                "events" => {
+                    match agents_get(&format!("/api/v1/agents/{}/events", id)) {
+                        Ok(body) => {
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            let events = parsed["events"]
+                                .as_array()
+                                .or_else(|| parsed["items"].as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            if events.is_empty() {
+                                renderer.render(UiLine::CommandOutput(
+                                    "  No events.\n".to_string(),
+                                ));
+                            } else {
+                                let mut out = String::from("  Events:\n");
+                                for ev in events.iter().rev().take(20).rev() {
+                                    let seq = ev["seq"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
+                                    let etype = ev["type"].as_str().unwrap_or("-");
+                                    let ts = ev["timestamp"].as_u64().map(|t| t.to_string()).unwrap_or_else(|| "-".to_string());
+                                    let preview = ev["data"]
+                                        .as_str()
+                                        .or_else(|| ev["text"].as_str())
+                                        .unwrap_or("")
+                                        .chars()
+                                        .take(60)
+                                        .collect::<String>();
+                                    out.push_str(&format!(
+                                        "    [{}] {} (ts:{}) {}\n",
+                                        seq, etype, ts, preview
+                                    ));
+                                }
+                                renderer.render(UiLine::CommandOutput(out));
+                            }
+                        }
+                        Err(e) => {
+                            renderer.render(UiLine::Error(format!(
+                                "  agents events failed: {}\n",
+                                e
+                            )));
+                        }
+                    }
+                }
                 _ => {
                     renderer.render(UiLine::Error(format!(
-                        "  Unknown action '{}'. Use: start, cancel\n",
+                        "  Unknown action '{}'. Use: start, cancel, events\n",
                         action
                     )));
                 }
             }
         }
+        [id, action, rest @ ..] if action.eq_ignore_ascii_case("input") => {
+            let text = rest.join(" ");
+            if text.is_empty() {
+                renderer.render(UiLine::Error(
+                    "  Usage: /agents <id> input <text>\n".to_string(),
+                ));
+            } else {
+                let payload = serde_json::json!({
+                    "type": "append_input",
+                    "payload": { "text": text }
+                });
+                let path = format!("/api/v1/agents/{}/commands", id);
+                match agents_post(&path, &payload) {
+                    Ok(body) => {
+                        let v: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
+                        if let Some(msg) = v["message"].as_str() {
+                            renderer.render(UiLine::CommandOutput(format!(
+                                "  Input rejected: {}\n", msg
+                            )));
+                        } else {
+                            renderer.render(UiLine::CommandOutput(
+                                "  Input sent.\n".to_string(),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        renderer.render(UiLine::Error(format!(
+                            "  agents input failed: {}\n", e
+                        )));
+                    }
+                }
+            }
+        }
         _ => {
             renderer.render(UiLine::CommandOutput(
-                "  Usage: /agents, /agents <id>, /agents <id> start|cancel, /agents new|create\n"
+                "  Usage: /agents, /agents <id>, /agents <id> start|cancel|events, /agents <id> input <text>, /agents new|create\n"
                     .to_string(),
             ));
         }
@@ -2211,6 +2291,53 @@ fn agents_post_command(id: &str, cmd_type: &str) -> Result<String> {
     let path = format!("/api/v1/agents/{}/commands", id);
     let payload = serde_json::json!({ "type": cmd_type });
     agents_post(&path, &payload)
+}
+
+fn spawn_agent_poll(id: &str, poll_tx: &tokio::sync::mpsc::UnboundedSender<AgentPollEvent>) {
+    let agent_id = id.to_string();
+    let tx = poll_tx.clone();
+    let base = agents_base_url();
+    std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::new();
+        let url = format!("{}/api/v1/agents/{}", base, agent_id);
+        let mut last_status = String::new();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let resp = client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send();
+            let body = match resp {
+                Ok(r) if r.status().is_success() => r.text().unwrap_or_default(),
+                _ => continue,
+            };
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let v = if parsed.get("agent").is_some() { &parsed["agent"] } else { &parsed };
+            let status = v["status"].as_str().unwrap_or("unknown").to_string();
+            if !last_status.is_empty() && status != last_status {
+                let _ = tx.send(AgentPollEvent::StatusChanged {
+                    agent_id: agent_id.clone(),
+                    old_status: last_status.clone(),
+                    new_status: status.clone(),
+                });
+            }
+            if status == "waiting_input" && last_status != "waiting_input" {
+                let _ = tx.send(AgentPollEvent::WaitingInput {
+                    agent_id: agent_id.clone(),
+                });
+            }
+            last_status = status.clone();
+            match status.as_str() {
+                "completed" | "failed" | "cancelled" => {
+                    let _ = tx.send(AgentPollEvent::PollFinished {
+                        agent_id: agent_id.clone(),
+                    });
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
 }
 
 /// Detect the current branch name in a directory.
