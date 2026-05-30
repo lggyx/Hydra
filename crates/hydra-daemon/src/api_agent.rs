@@ -15,6 +15,7 @@ use hydra_core::config::Config;
 use hydra_core::provider;
 use hydra_core::session::{Session, SessionId, SessionManager};
 use hydra_core::tool::ToolRegistry;
+use hydra_core::turn::{event::{TurnEvent, TurnResult}, runner::TurnRunner};
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -160,14 +161,6 @@ impl AgentStore {
 
     fn list(&self) -> Vec<AgentSnapshot> {
         self.agents.values().cloned().collect()
-    }
-
-    fn resolve_id(&self, id: &str) -> Option<String> {
-        if self.agents.contains_key(id) {
-            return Some(id.to_string());
-        }
-        let matches: Vec<_> = self.agents.keys().filter(|k| k.starts_with(id)).collect();
-        if matches.len() == 1 { Some(matches[0].clone()) } else { None }
     }
 
     fn update_status(&mut self, id: &str, status: AgentStatus) {
@@ -326,11 +319,11 @@ impl AgentRegistry {
         let command_id = uuid::Uuid::new_v4().to_string();
 
         if req.type_.as_str() == "start" {
-            self.spawn_agent_execution(id.to_string());
+            self.spawn_agent_execution(id.to_string()).await;
         } else if req.type_.as_str() == "append_input" {
-            self.spawn_agent_execution(id.to_string());
+            self.spawn_agent_execution(id.to_string()).await;
         } else if req.type_.as_str() == "cancel" {
-            self.cancel_agent_execution(&id);
+            self.cancel_agent_execution(&id).await;
         }
 
         Ok(PostAgentCommandResponse {
@@ -377,7 +370,7 @@ impl AgentRegistry {
 
     /// Spawn a real agent execution using hydra-core's TurnRunner.
     /// Falls back to mock progression if config/provider setup fails.
-    pub(crate) fn spawn_agent_execution(&self, agent_id: String) {
+    pub(crate) async fn spawn_agent_execution(&self, agent_id: String) {
         let store = self.store.clone();
         let event_store = self.event_store.clone();
         let active_tokens = self.active_tokens.clone();
@@ -387,10 +380,12 @@ impl AgentRegistry {
         active_tokens.write().await.insert(agent_id.clone(), cancel_token.clone());
 
         tokio::spawn(async move {
-            // Cleanup token when done
-            let _token_guard = scopeguard::guard(cancel_token.clone(), |token| {
+            // Cleanup token when done. Clone agent_id for the guard so the
+            // original can be moved into run_mock_progression on fallback.
+            let agent_id_for_cleanup = agent_id.clone();
+            let _token_guard = scopeguard::guard((), move |_| {
                 let mut tokens = active_tokens.blocking_write();
-                tokens.remove(&agent_id);
+                tokens.remove(&agent_id_for_cleanup);
             });
 
             let working_dir = match {
@@ -400,7 +395,7 @@ impl AgentRegistry {
                 Some(d) => d,
                 None => {
                     set_status(&store, &agent_id, AgentStatus::Failed);
-                    append_event(&event_store, &agent_id, "status_changed", serde_json::json!({"status": "failed", "error": "agent not found"}));
+                    append_event(&event_store, &agent_id, "status_changed", Some(serde_json::json!({"status": "failed", "error": "agent not found"})));
                     return;
                 }
             };
@@ -421,14 +416,6 @@ impl AgentRegistry {
         });
     }
 
-    /// Legacy mock progression — kept as fallback when real execution fails.
-    fn spawn_mock_progression(&self, agent_id: String) {
-        let store = self.store.clone();
-        let event_store = self.event_store.clone();
-        tokio::spawn(async move {
-            run_mock_progression(store, event_store, agent_id).await;
-        });
-    }
 }
 
 /// Shared mock progression logic used as fallback.
@@ -534,8 +521,6 @@ async fn run_real_execution(
         list_dir::ListDirTool, read::ReadFileTool, search_replace::SearchReplaceTool,
         write::WriteFileTool,
     };
-    use hydra_core::turn::{TurnRunner, event::TurnEvent};
-
     // 1. Load config
     let config_path = Config::default_path();
     let config = match Config::load(&config_path) {
@@ -566,7 +551,7 @@ async fn run_real_execution(
     let mut session = {
         let s = store.read().await;
         if let Some(ref sid) = s.get(&agent_id).and_then(|a| a.session_id.clone()) {
-            let session_id = SessionId::from_string(sid);
+            let session_id = SessionId::from_string(sid.to_string());
             session_manager.load(&session_id).unwrap_or_else(|_| Session::new(working_dir.clone().into()))
         } else {
             Session::new(working_dir.clone().into())
@@ -578,7 +563,7 @@ async fn run_real_execution(
     conversation.messages = session.messages.clone();
 
     // 6. Build tool registry (mirrors process_chat_request)
-    let mut tool_context = hydra_core::tool::ToolContext::new(working_dir.clone().into());
+    let tool_context = hydra_core::tool::ToolContext::new(working_dir.clone().into());
     let mut tool_registry = ToolRegistry::new();
 
     tool_registry.register_sync(Box::new(ReadFileTool));
@@ -642,9 +627,8 @@ async fn run_real_execution(
 
     // 13. Run turn loop
     let mut total_tool_calls: usize = 0;
-    let mut final_summary = String::new();
 
-    loop {
+    let final_summary = loop {
         // Check if cancelled before each turn
         if cancel_token.is_cancelled() {
             set_status(&store, &agent_id, AgentStatus::Cancelled);
@@ -672,18 +656,9 @@ async fn run_real_execution(
         }
 
         match result {
-            hydra_core::turn::event::TurnResult::Responded { text, .. } => {
-                final_summary = text;
-                break;
-            }
-            hydra_core::turn::event::TurnResult::UsedTools { text, .. } => {
-                if let Some(t) = text {
-                    final_summary = t;
-                }
-                // Continue for next turn (tools were executed, LLM may need another round)
-                continue;
-            }
-            hydra_core::turn::event::TurnResult::Failed(e) => {
+            TurnResult::Responded { text, .. } => break text,
+            TurnResult::UsedTools { .. } => continue,
+            TurnResult::Failed(e) => {
                 set_status(&store, &agent_id, AgentStatus::Failed);
                 append_event(
                     &event_store,
@@ -693,7 +668,7 @@ async fn run_real_execution(
                 );
                 return Ok(());
             }
-            hydra_core::turn::event::TurnResult::Cancelled => {
+            TurnResult::Cancelled => {
                 set_status(&store, &agent_id, AgentStatus::Cancelled);
                 append_event(
                     &event_store,
@@ -704,7 +679,7 @@ async fn run_real_execution(
                 return Ok(());
             }
         }
-    }
+    };
 
     // 14. Save session
     session.messages = conversation.messages;
