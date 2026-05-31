@@ -2033,12 +2033,13 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                         for a in &agents {
                             let id = a["id"].as_str().unwrap_or("-");
                             let short_id = &id[..8.min(id.len())];
+                            let kind = a["kind"].as_str().unwrap_or("execution");
                             let status = a["status"].as_str().unwrap_or("-");
                             let name = a["name"].as_str().unwrap_or("-");
                             let updated = a["updated_at"].as_u64().map(|t| t.to_string()).unwrap_or_else(|| "-".to_string());
                             out.push_str(&format!(
-                                "    {}  {}  {}  (updated: {})\n",
-                                short_id, status, name, updated
+                                "    {}  {}  {}  {}  (updated: {})\n",
+                                short_id, kind, status, name, updated
                             ));
                         }
                         out.push_str(&format!("  ({} agents total)\n", agents.len()));
@@ -2061,6 +2062,9 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
             if let Some(branch) = parse_arg(arg, &["--branch", "-b"]) {
                 payload["branch_name"] = serde_json::json!(branch);
             }
+            if let Some(kind) = parse_arg(arg, &["--kind", "-k"]) {
+                payload["metadata"] = serde_json::json!({"kind": kind});
+            }
             match agents_post("/api/v1/agents", &payload) {
                 Ok(body) => {
                     let parsed: serde_json::Value =
@@ -2069,9 +2073,13 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                     let id = v["id"].as_str().unwrap_or("-");
                     let name = v["name"].as_str().unwrap_or("(unnamed)");
                     let status = v["status"].as_str().unwrap_or("-");
+                    let kind = v["metadata"].as_object()
+                        .and_then(|m| m.get("kind"))
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("execution");
                     renderer.render(UiLine::CommandOutput(format!(
-                        "  Created agent: {} ({}) [{}]\n",
-                        name, id, status
+                        "  Created {} agent: {} ({}) [{}]\n",
+                        kind, name, id, status
                     )));
                 }
                 Err(e) => {
@@ -2098,10 +2106,11 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                         .as_u64()
                         .map(|n| n.to_string())
                         .unwrap_or_else(|| "-".to_string());
+                    let kind = v["kind"].as_str().unwrap_or("execution");
                     let summary = v["summary"].as_str().unwrap_or("-");
                     let out = format!(
-                        "  Agent: {} ({})\n    Status:      {}\n    Provider:    {}\n    Working dir: {}\n    Session:     {}\n    Last event:  seq {}\n    Summary:     {}\n",
-                        name, full_id, status, provider, working_dir, session_id, last_event_seq, summary
+                        "  Agent: {} ({}) [{}]\n    Status:      {}\n    Provider:    {}\n    Working dir: {}\n    Session:     {}\n    Last event:  seq {}\n    Summary:     {}\n",
+                        name, full_id, kind, status, provider, working_dir, session_id, last_event_seq, summary
                     );
                     renderer.render(UiLine::CommandOutput(out));
                 }
@@ -2265,7 +2274,7 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
         }
         _ => {
             renderer.render(UiLine::CommandOutput(
-                "  Usage: /agents, /agents <id>, /agents <id> start|cancel|events, /agents <id> input <text>, /agents new|create [--worktree <id>] [--branch <name>]\n"
+                "  Usage: /agents, /agents <id>, /agents <id> start|cancel|events, /agents <id> input <text>, /agents new|create [--worktree <id>] [--branch <name>] [--kind execution|orchestrator]\n"
                     .to_string(),
             ));
         }

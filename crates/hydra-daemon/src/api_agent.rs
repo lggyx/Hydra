@@ -51,6 +51,7 @@ pub struct AgentErrorInfo {
 pub struct AgentSnapshot {
     pub id: String,
     pub name: String,
+    pub kind: String, // "execution" or "orchestrator"
     pub status: AgentStatus,
     pub provider: Option<String>,
     pub working_dir: String,
@@ -242,9 +243,17 @@ impl AgentRegistry {
         let now = now_ts();
         let working_dir = req.working_dir.unwrap_or_else(|| default_working_dir.to_string());
         let branch_name = req.branch_name.or_else(|| detect_branch_from_dir(&working_dir));
+        let kind = req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("execution")
+            .to_string();
         let agent = AgentSnapshot {
             id: id.clone(),
             name: req.name.unwrap_or_else(|| format!("agent-{}", &id[..8])),
+            kind,
             status: AgentStatus::Created,
             provider: req.provider,
             working_dir,
@@ -461,6 +470,60 @@ impl AgentRegistry {
         });
     }
 
+}
+
+impl hydra_core::agent::orchestrator::AgentControl for AgentRegistry {
+    fn create_execution(&self, task: &str, branch: Option<&str>, worktree: Option<&str>) -> String {
+        let default_dir = std::env::current_dir()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        let req = CreateAgentRequest {
+            name: Some(format!("exec-{}", &task.chars().take(20).collect::<String>())),
+            provider: None,
+            working_dir: Some(default_dir.clone()),
+            session_id: None,
+            initial_input: Some(task.to_string()),
+            metadata: None,
+            worktree_id: worktree.map(|s| s.to_string()),
+            branch_name: branch.map(|s| s.to_string()),
+        };
+        let rt = tokio::runtime::Handle::current();
+        let agent = rt.block_on(async { self.create(req, &default_dir).await });
+        agent.id
+    }
+
+    fn start_agent(&self, id: &str, message: &str) {
+        let rt = tokio::runtime::Handle::current();
+        let cmd = PostAgentCommandRequest {
+            type_: "start".to_string(),
+            payload: Some(serde_json::json!({"message": message})),
+        };
+        let _ = rt.block_on(async { self.post_command(id, cmd).await });
+    }
+
+    fn cancel_agent(&self, id: &str) {
+        let rt = tokio::runtime::Handle::current();
+        let cmd = PostAgentCommandRequest {
+            type_: "cancel".to_string(),
+            payload: None,
+        };
+        let _ = rt.block_on(async { self.post_command(id, cmd).await });
+    }
+
+    fn agent_status(&self, id: &str) -> Option<String> {
+        let rt = tokio::runtime::Handle::current();
+        let agent = rt.block_on(async { self.get(id).await });
+        agent.map(|a| format!("{:?}", a.status).to_lowercase())
+    }
+
+    fn list_agents(&self) -> Vec<(String, String)> {
+        let rt = tokio::runtime::Handle::current();
+        let agents = rt.block_on(async { self.list().await });
+        agents
+            .into_iter()
+            .map(|a| (a.id, format!("{:?}", a.status).to_lowercase()))
+            .collect()
+    }
 }
 
 /// Shared mock progression logic used as fallback.
