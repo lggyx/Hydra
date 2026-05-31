@@ -1,9 +1,11 @@
 # Hydra Architecture Design Document
 
-**Version**: 0.1.0-draft  
-**Date**: 2026-05-30  
+**Version**: 0.2.0  
+**Date**: 2026-05-31  
 **Status**: Draft — open for review  
 
+> **阅读指南**：本文档描述 Hydra 的**目标架构**。标注为**「规划态」**的章节尚未实现，当前代码采用不同的路径。
+> 实际已实现的架构见 [当前实现契约](./current-implementation-contract.md)。
 ---
 
 ## 1. Design Principles
@@ -18,7 +20,7 @@
 
 ---
 
-## 2. System Topology
+## 2. System Topology *(规划态)*
 
 ```
                          ┌──────────────────────────┐
@@ -69,7 +71,7 @@
 
 ---
 
-## 3. Core Abstractions
+## 3. Core Abstractions *(规划态)*
 
 ### 3.1 Agent Trait (universal interface)
 
@@ -345,7 +347,7 @@ pub struct AgentMetrics {
 
 ---
 
-## 4. ResourceManager (the router)
+## 4. ResourceManager (the router) *(规划态)*
 
 ResourceManager is the **only** component that directly addresses agents by ID.
 All other components interact through channels or read-only snapshots.
@@ -440,7 +442,7 @@ impl ResourceManager {
 
 ---
 
-## 5. Agent Implementations
+## 5. Agent Implementations *(规划态)*
 
 ### 5.1 ExecutionAgent (the worker)
 
@@ -461,7 +463,7 @@ pub struct ExecutionAgent {
 }
 ```
 
-**Tool scoping** (from atomcode's `ScopedReadFile` pattern):  
+**Tool scoping** (from hydra's `ScopedReadFile` pattern):  
 ExecutionAgent only has tools relevant to its assigned files. If assigned `Service.java`,
 `read_file` is wrapped to reject any path other than `Service.java`.
 
@@ -596,7 +598,7 @@ ISO-Framework guarantees:
 
 ---
 
-## 8. Crate Structure
+## 8. Crate Structure *(规划态)*
 
 ```
 hydra/
@@ -798,7 +800,7 @@ Adapter layer (hydra-workspace/src/adapter.rs):
 | Agent hangs (no progress) | Killed after configurable timeout | Orchestrator's idle detection (rule floor) |
 | Worktree corruption | No data loss on main branch | ISO-Framework: never deletes unmerged branches |
 | Orphaned worktrees | GC on cleanup | ISO-Framework::gc() |
-| Network failure (LLM) | Retry with backoff, then kill | TurnRunner retry logic (from atomcode) |
+| Network failure (LLM) | Retry with backoff, then kill | TurnRunner retry logic (from hydra) |
 | Git merge conflict | Agent killed, conflict preserved | ISO-Framework conflict detection |
 | ResourceManager panic | Agents continue running (they hold event_tx sender) | Agents send events via sender; RM owns event_rx but agents don't depend on RM after spawn |
 
@@ -817,7 +819,7 @@ Adapter layer (hydra-workspace/src/adapter.rs):
 
 ---
 
-## 12. Implementation Sequence
+## 12. Implementation Sequence *(规划态)*
 
 ```
 Phase 0 (1 week): Foundations

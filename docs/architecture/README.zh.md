@@ -68,6 +68,6 @@ hydra/
 | 项目 | 地址 | 关联 |
 |------|------|------|
 | ISO-Framework | https://github.com/snehith01001110/ISO-Framework | **Fork 目标** —— worktree 安全 |
-| atomcode | /mnt/c/Users/15853/Workspace/Hydra/atomcode | **上游依赖** —— Provider、Tool、TurnRunner |
+| hydra | /mnt/c/Users/15853/Workspace/Hydra/hydra | **上游依赖** —— Provider、Tool、TurnRunner |
 | AutoAgents | https://github.com/liquidos-ai/AutoAgents | 参考 —— typed pub/sub、agent trait |
 | forge | https://github.com/automagik-dev/forge | 参考 —— UX 模式（不 fork） |

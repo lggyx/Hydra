@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+# Glob picks up the closed-source `hydra-codingplan-crypto` overlay
+# the official build pipeline drops into `crates/` (see the stub at
+# `crates/hydra-codingplan-crypto/`). Adding any future crate is also
+# a no-toml-edit operation.
+members = ["crates/*"]
+# `hydra-codingplan-crypto` is intentionally absent from default-members:
+# the stub is wired into hydra-core via an optional dep behind the
+# `codingplan-crypto` feature, so a default `cargo build` from the
+# workspace root has no reason to compile it. The official build picks
+# it up explicitly via `--features hydra-core/codingplan-crypto`.
+default-members = [
+    "crates/hydra-core",
+    "crates/hydra-cli",
+    "crates/hydra-daemon",
+    "crates/hydra-telemetry",
+    "crates/hydra-tuix",
+]
+
+[profile.release]
+opt-level = "z"        # Optimize for size
+lto = true             # Link-time optimization — eliminates dead code across crates
+codegen-units = 1      # Single codegen unit — better optimization, slower build
+strip = true           # Strip symbols automatically
+panic = "abort"        # Remove panic unwinding code — saves ~200-500KB
+
+[profile.test]
+debug = "line-tables-only" # Smaller binaries, faster linker
+
+[workspace.package]
+version = "4.23.3"
+edition = "2021"
+license = "MIT"
+repository = "https://atomgit.com/atomgit_atomcode/hydra"
+description = "Open-source terminal AI coding agent"
+
+[workspace.dependencies]
+anyhow = "1"

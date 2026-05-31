@@ -267,7 +267,7 @@ flowchart TB
 
     subgraph "外部依赖"
         ISO["iso-code crate"]
-        ATO["atomcode-core"]
+        ATO["hydra-core"]
     end
 
     WS --> ISO

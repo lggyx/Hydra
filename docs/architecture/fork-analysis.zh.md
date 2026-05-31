@@ -95,7 +95,7 @@
 | 10+ LLM 提供方 | ✅ OpenAI、Anthropic、DeepSeek 等 | Hydra 初期只需要 3-4 个提供方 |
 | WASM sandboxed tools | ✅ | Hydra 使用原生 Rust tools（代码编辑更强大） |
 | Memory backends | ✅ | 非 Hydra 优先级（Hydra 用 git 做 memory） |
-| Sliding window context | ✅ | Hydra 用 atomcode 的 hot/cold 上下文策略 |
+| Sliding window context | ✅ | Hydra 用 hydra 的 hot/cold 上下文策略 |
 
 **结论**: 不 fork。AutoAgents 解决的是不同问题（通用 Agent 框架）。Hydra 的价值在代码生成专用层（git worktree 隔离 + LLM 驱动调度 + tool scoping）。AutoAgents 的 Agent trait 可以影响 Hydra 的设计，但直接集成会增加复杂度而没有对等的价值。
 

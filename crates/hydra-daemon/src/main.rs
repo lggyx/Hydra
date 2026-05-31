@@ -1,0 +1,3415 @@
+//! Hydra API Service
+//!
+//! Provides HTTP API for querying conversation history and streaming chat.
+
+// On Windows, mark this binary as a GUI-subsystem application so that
+// launching it from a GUI parent (e.g. VSCode extension host) does NOT
+// allocate a visible console window. When launched from a terminal the
+// daemon will attempt to re-attach to the parent console for stderr output.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+mod api_auth;
+mod api_branch;
+mod api_codingplan;
+mod api_config;
+mod api_provider;
+mod api_agent;
+mod api_worktree;
+mod telemetry_scope;
+
+pub(crate) use telemetry_scope::daemon_scope;
+
+use axum::{
+    extract::{Path, Query, State},
+    http::{header, request::Parts as RequestParts, HeaderValue, Method, StatusCode},
+    response::{sse::Sse, IntoResponse, Json},
+    routing::{delete, get, post},
+    Router,
+};
+use futures::stream::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch, RwLock};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+
+use hydra_core::config::Config;
+use hydra_core::conversation::Conversation;
+use hydra_core::lsp::manager::build_lsp_manager;
+use hydra_core::mcp::{register_mcp_tools, McpRegistry};
+use hydra_core::provider;
+use hydra_core::session::{Session, SessionId, SessionManager, SessionMeta};
+use hydra_core::tool::diagnostics::DiagnosticsTool;
+use hydra_core::tool::{ToolContext, ToolRegistry};
+use hydra_core::turn::event::{TurnEvent, TurnResult};
+use hydra_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
+use hydra_core::turn::runner::TurnRunner;
+use hydra_telemetry::{
+    config::{resolve, ProcessEnv},
+    CliOverride, CurrentContext, Event, RepoOrigin, SessionMode,
+    Telemetry, TelemetryState,
+};
+use hydra_core::auth;
+use hydra_core::telemetry_bootstrap::detect_repo_origin;
+
+// ============================================================================
+// Shared DTOs for P0 API endpoints
+// ============================================================================
+
+/// Structured error response for all new P0 endpoints.
+#[derive(Debug, Serialize)]
+pub(crate) struct ApiError {
+    pub success: bool,
+    pub error: String,
+}
+
+/// Sanitized config response (never exposes api_key).
+#[derive(Debug, Serialize)]
+pub(crate) struct ConfigResponse {
+    pub path: PathBuf,
+    pub default_provider: String,
+    pub default_workdir: Option<String>,
+    pub providers: Vec<ProviderInfo>,
+}
+
+/// Sanitized provider view (no api_key).
+#[derive(Debug, Serialize)]
+pub(crate) struct ProviderInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub has_api_key: bool,
+    pub is_default: bool,
+    pub context_window: usize,
+    pub max_tokens: Option<usize>,
+    pub thinking_enabled: Option<bool>,
+    pub thinking_budget: Option<u32>,
+    pub thinking_type: Option<String>,
+    pub thinking_keep: Option<String>,
+    pub reasoning_history: Option<String>,
+    pub skip_tls_verify: bool,
+    pub ephemeral: bool,
+}
+
+/// In-flight OAuth login session stored in daemon memory.
+pub struct LoginSessionEntry {
+    pub session: hydra_core::auth::LoginSession,
+    pub created_at: std::time::Instant,
+}
+
+/// Login sessions store: login_id -> LoginSessionEntry
+pub(crate) type LoginSessionsStore = Arc<RwLock<HashMap<String, LoginSessionEntry>>>;
+
+/// Create a structured JSON error response.
+pub(crate) fn json_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ApiError>) {
+    (
+        status,
+        Json(ApiError {
+            success: false,
+            error: message.into(),
+        }),
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectInfo {
+    /// Project hash (directory name in sessions/)
+    pub hash: String,
+    /// Project name (user-defined or directory name)
+    pub name: String,
+    /// Working directory path (from session files)
+    pub working_dir: PathBuf,
+    /// Optional description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Number of sessions
+    pub session_count: usize,
+    /// Creation timestamp
+    pub created_at: u64,
+    /// Last update timestamp
+    pub last_updated: u64,
+}
+
+/// Current project state (working directory)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectState {
+    /// Current working directory
+    pub working_dir: PathBuf,
+    /// Previous working directory (for /cd -)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_dir: Option<PathBuf>,
+    /// Recently visited directories (max 5)
+    pub recent_dirs: Vec<PathBuf>,
+    /// Project name (derived from directory name)
+    pub name: String,
+}
+
+/// Request to change working directory
+#[derive(Debug, Deserialize)]
+pub struct ChangeDirRequest {
+    /// New working directory path, or "-" to go back
+    pub path: String,
+}
+
+/// Response after changing directory
+#[derive(Debug, Serialize)]
+pub struct ChangeDirResponse {
+    pub success: bool,
+    pub message: String,
+    pub current_dir: PathBuf,
+    pub project_hash: String,
+}
+
+/// Search query parameters
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    /// Search keyword for session name
+    pub q: String,
+}
+
+/// Request to create a new session
+#[derive(Debug, Deserialize)]
+pub struct CreateSessionRequest {
+    /// Optional working directory (uses current project dir if not provided)
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    /// Optional session title
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// Response for created session
+#[derive(Debug, Serialize)]
+pub struct CreateSessionResponse {
+    pub id: String,
+    pub name: String,
+    pub working_dir: PathBuf,
+    pub project_hash: String,
+    pub created_at: u64,
+}
+
+/// Session detail response
+#[derive(Debug, Serialize)]
+pub struct SessionDetail {
+    pub id: String,
+    pub name: String,
+    pub working_dir: PathBuf,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub message_count: usize,
+    pub messages: Vec<MessageInfo>,
+}
+
+/// Global project state store (current working directory)
+type ProjectStateStore = Arc<RwLock<ProjectState>>;
+
+/// Active chat tasks (session_id -> cancellation token)
+type ChatTasksStore = Arc<RwLock<HashMap<String, CancellationToken>>>;
+
+/// Stopped sessions (session_id) - used to prevent saving stopped chats
+type StoppedSessionsStore = Arc<RwLock<HashSet<String>>>;
+
+const DANGEROUS_TOOLS_ENV: &str = "HYDRA_DAEMON_ENABLE_DANGEROUS_TOOLS";
+
+/// RAII guard that decrements `active_connections` on drop, ensuring the counter
+/// is always decremented even if the SSE client disconnects abruptly (TCP RST).
+struct SseConnectionGuard(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Combined app state for Axum
+#[derive(Clone)]
+pub struct AppState {
+    pub sessions: SessionStore,
+    pub project: ProjectStateStore,
+    /// Active chat tasks that can be cancelled
+    pub chat_tasks: ChatTasksStore,
+    /// Sessions that were stopped - their messages should not be saved
+    pub stopped_sessions: StoppedSessionsStore,
+    /// MCP server registry (global, used for /mcp/status backward compat)
+    pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,
+    /// Per-project MCP registry cache (keyed by working_dir)
+    pub mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
+    /// In-flight OAuth login sessions (login_id -> entry)
+    pub login_sessions: LoginSessionsStore,
+    /// Shared telemetry handle (R1.4)
+    pub telemetry: Arc<Telemetry>,
+    /// Repo origin detected at daemon launch (R4.2)
+    pub repo_origin: RepoOrigin,
+    /// Sender to trigger graceful shutdown via POST /shutdown (R7.1, R7.2)
+    pub shutdown_tx: watch::Sender<bool>,
+    /// Timestamp (unix ms) of last non-health HTTP request — used for idle timeout
+    pub last_activity: Arc<std::sync::atomic::AtomicI64>,
+    /// Number of active SSE streaming connections (chat in progress)
+    pub active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    pub agent_registry: Arc<api_agent::AgentRegistry>,
+}
+
+/// Cached MCP registry for a specific project directory.
+pub struct CachedMcpRegistry {
+    pub registry: Arc<McpRegistry>,
+    pub last_used: std::time::Instant,
+}
+
+/// Maximum number of per-project MCP registries to cache.
+const MCP_CACHE_MAX: usize = 5;
+
+/// Get default working directory
+fn default_working_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Initialize project state from config or default
+fn init_project_state() -> ProjectState {
+    let config_path = Config::default_path();
+    if let Ok(config) = Config::load(&config_path) {
+        if let Some(ref workdir) = config.default_workdir {
+            let path = PathBuf::from(workdir);
+            if path.exists() {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "project".to_string());
+                return ProjectState {
+                    working_dir: path,
+                    previous_dir: None,
+                    recent_dirs: vec![],
+                    name,
+                };
+            }
+        }
+    }
+    let path = default_working_dir();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string());
+    ProjectState {
+        working_dir: path,
+        previous_dir: None,
+        recent_dirs: vec![],
+        name,
+    }
+}
+/// Artifact info for API response
+#[derive(Debug, Serialize, Clone)]
+pub struct ArtifactInfo {
+    pub id: String,
+    pub artifact_type: String, // "html", "svg", "mermaid", "code"
+    pub title: Option<String>,
+    pub language: Option<String>,
+    pub content: String,
+}
+
+/// Tool call info for API response
+#[derive(Debug, Serialize)]
+pub struct ToolCallInfo {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    pub display: String,
+}
+
+/// Tool result info for API response
+#[derive(Debug, Serialize)]
+pub struct ToolResultInfo {
+    pub call_id: String,
+    pub success: bool,
+    pub summary: String,
+    pub line_count: usize,
+}
+
+/// Message info for API response
+#[derive(Debug, Serialize)]
+pub struct MessageInfo {
+    pub role: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallInfo>>,
+    /// Tool result summary (for tool role messages)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<ToolResultInfo>,
+    /// Artifacts detected in this message (code blocks, HTML files, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<ArtifactInfo>>,
+}
+
+impl From<&hydra_core::conversation::message::Message> for MessageInfo {
+    fn from(msg: &hydra_core::conversation::message::Message) -> Self {
+        let role = match msg.role {
+            hydra_core::conversation::message::Role::System => "system",
+            hydra_core::conversation::message::Role::User => "user",
+            hydra_core::conversation::message::Role::Assistant => "assistant",
+            hydra_core::conversation::message::Role::Tool => "tool",
+        };
+
+        let (content, tool_calls, tool_result, artifacts) = match &msg.content {
+            hydra_core::conversation::message::MessageContent::Text(s) => {
+                // No artifacts from plain text messages (code blocks not extracted)
+                (s.clone(), None, None, None)
+            }
+            hydra_core::conversation::message::MessageContent::AssistantWithToolCalls {
+                text,
+                tool_calls,
+                ..
+            } => {
+                let calls: Vec<ToolCallInfo> = tool_calls
+                    .iter()
+                    .map(|tc| ToolCallInfo {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                        display: format_tool_args(&tc.name, &tc.arguments),
+                    })
+                    .collect();
+
+                // Extract artifacts from tool calls (e.g., write_file for HTML)
+                let artifacts = extract_artifacts_from_tool_calls(tool_calls);
+                (
+                    text.clone().unwrap_or_default(),
+                    Some(calls),
+                    None,
+                    artifacts,
+                )
+            }
+            hydra_core::conversation::message::MessageContent::ToolResult(r) => {
+                let lines = r.output.lines().count();
+                let first_line = r.output.lines().next().unwrap_or("");
+                let summary = if first_line.len() > 100 {
+                    format!("{}...", first_line.chars().take(97).collect::<String>())
+                } else {
+                    first_line.to_string()
+                };
+                (
+                    r.output.clone(),
+                    None,
+                    Some(ToolResultInfo {
+                        call_id: r.call_id.clone(),
+                        success: r.success,
+                        summary,
+                        line_count: lines,
+                    }),
+                    None,
+                )
+            }
+            hydra_core::conversation::message::MessageContent::ToolResultRef(r) => {
+                (r.summary.clone(), None, None, None)
+            }
+            hydra_core::conversation::message::MessageContent::MultiPart { text, images } => {
+                let desc = format!(
+                    "{}[{} image(s)]",
+                    text.as_deref().unwrap_or(""),
+                    images.len()
+                );
+                (desc, None, None, None)
+            }
+        };
+
+        Self {
+            role: role.to_string(),
+            content,
+            tool_calls,
+            tool_result,
+            artifacts,
+        }
+    }
+}
+
+/// Extract artifacts from tool calls (e.g., write_file creating HTML files)
+fn extract_artifacts_from_tool_calls(
+    tool_calls: &[hydra_core::tool::ToolCall],
+) -> Option<Vec<ArtifactInfo>> {
+    let mut artifacts = Vec::new();
+
+    for tc in tool_calls {
+        if tc.name == "create_file" || tc.name == "edit_file" {
+            // Parse arguments
+            let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let path = match args.get("file_path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let (artifact_type, language) = if path.ends_with(".html") || path.ends_with(".htm") {
+                ("html", "html")
+            } else if path.ends_with(".svg") {
+                ("svg", "xml")
+            } else if path.ends_with(".md") || path.ends_with(".markdown") {
+                ("markdown", "markdown")
+            } else if path.ends_with(".pptx") {
+                ("pptx", "pptx")
+            } else if path.ends_with(".docx") {
+                ("docx", "docx")
+            } else if path.ends_with(".xlsx") {
+                ("xlsx", "xlsx")
+            } else if path.ends_with(".pdf") {
+                ("pdf", "pdf")
+            } else {
+                continue; // Skip other file types
+            };
+
+            // Get content from arguments (optional for binary files)
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Extract title from path
+            let title = PathBuf::from(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string());
+
+            artifacts.push(ArtifactInfo {
+                id: format!("file-{}", artifacts.len() + 1),
+                artifact_type: artifact_type.to_string(),
+                title,
+                language: Some(language.to_string()),
+                content,
+            });
+        } else if tc.name == "bash" {
+            // Extract artifacts from bash commands that create files
+            let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let command = match args.get("command").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Look for file redirection ( > or >> ) to artifact file types
+            if let Some(path) = extract_output_file_from_bash(command) {
+                let (artifact_type, language) = if path.ends_with(".html") || path.ends_with(".htm")
+                {
+                    ("html", "html")
+                } else if path.ends_with(".svg") {
+                    ("svg", "xml")
+                } else if path.ends_with(".md") || path.ends_with(".markdown") {
+                    ("markdown", "markdown")
+                } else if path.ends_with(".pptx") {
+                    ("pptx", "pptx")
+                } else if path.ends_with(".docx") {
+                    ("docx", "docx")
+                } else if path.ends_with(".xlsx") {
+                    ("xlsx", "xlsx")
+                } else if path.ends_with(".pdf") {
+                    ("pdf", "pdf")
+                } else {
+                    continue;
+                };
+
+                let title = PathBuf::from(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string());
+
+                artifacts.push(ArtifactInfo {
+                    id: format!("file-{}", artifacts.len() + 1),
+                    artifact_type: artifact_type.to_string(),
+                    title,
+                    language: Some(language.to_string()),
+                    content: String::new(), // Content not available from bash
+                });
+            }
+        }
+    }
+
+    if artifacts.is_empty() {
+        None
+    } else {
+        Some(artifacts)
+    }
+}
+
+/// Extract output file path from bash command (handles > and >> redirection, and quoted paths)
+fn extract_output_file_from_bash(command: &str) -> Option<String> {
+    // Artifact file extensions to look for
+    let artifact_extensions = [
+        ".html",
+        ".htm",
+        ".svg",
+        ".md",
+        ".markdown",
+        ".pptx",
+        ".docx",
+        ".xlsx",
+        ".pdf",
+    ];
+
+    // First, try to find > or >> redirection
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '>' {
+            // Found redirection
+            let append_mode = i + 1 < chars.len() && chars[i + 1] == '>';
+            let start = if append_mode { i + 2 } else { i + 1 };
+
+            // Skip whitespace
+            let mut j = start;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+
+            // Extract file path until whitespace or end
+            let mut path_end = j;
+            while path_end < chars.len()
+                && !chars[path_end].is_whitespace()
+                && chars[path_end] != ';'
+                && chars[path_end] != '&'
+            {
+                path_end += 1;
+            }
+
+            if j < path_end {
+                let path: String = chars[j..path_end].iter().collect();
+                // Remove quotes if present
+                let path = path.trim_matches(|c| c == '"' || c == '\'').to_string();
+                if artifact_extensions.iter().any(|ext| path.ends_with(ext)) {
+                    return Some(path);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Look for quoted paths with artifact extensions
+    // Pattern: 'path.pptx' or "path.docx"
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut quote_start = 0usize;
+    let chars: Vec<char> = command.chars().collect();
+
+    for (idx, &ch) in chars.iter().enumerate() {
+        if ch == '\'' && !in_double_quote {
+            if in_single_quote {
+                // End of single-quoted string
+                let path: String = chars[quote_start..idx].iter().collect();
+                if artifact_extensions.iter().any(|ext| path.ends_with(ext)) {
+                    return Some(path);
+                }
+                in_single_quote = false;
+            } else {
+                in_single_quote = true;
+                quote_start = idx + 1;
+            }
+        } else if ch == '"' && !in_single_quote {
+            if in_double_quote {
+                // End of double-quoted string
+                let path: String = chars[quote_start..idx].iter().collect();
+                if artifact_extensions.iter().any(|ext| path.ends_with(ext)) {
+                    return Some(path);
+                }
+                in_double_quote = false;
+            } else {
+                in_double_quote = true;
+                quote_start = idx + 1;
+            }
+        }
+    }
+
+    None
+}
+
+/// Format tool arguments for display (CLI style)
+fn format_tool_args(tool_name: &str, args_json: &str) -> String {
+    let args: serde_json::Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    match tool_name {
+        "read_file" => {
+            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let short = short_path(path);
+            let mut s = short;
+            if let Some(offset) = args.get("offset").and_then(|v| v.as_u64()) {
+                if let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) {
+                    s.push_str(&format!(" L{}-{}", offset, offset + limit));
+                }
+            }
+            s
+        }
+        "create_file" => {
+            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let size = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0);
+            format!("{} ({} bytes)", short_path(path), size)
+        }
+        "edit_file" => {
+            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            short_path(path)
+        }
+        "bash" => {
+            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if cmd.chars().count() > 80 {
+                format!("`{}...`", cmd.chars().take(77).collect::<String>())
+            } else {
+                format!("`{}`", cmd)
+            }
+        }
+        "list_directory" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            short_path(path)
+        }
+        "grep" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            format!("\"{}\" in {}", pattern, short_path(path))
+        }
+        "glob" => {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            format!("\"{}\"", pattern)
+        }
+        "web_search" => {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            format!("\"{}\"", query)
+        }
+        "web_fetch" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            url.to_string()
+        }
+        _ => {
+            if let Some(obj) = args.as_object() {
+                obj.iter()
+                    .map(|(k, v)| {
+                        let val = match v {
+                            serde_json::Value::String(s) if s.chars().count() > 30 => {
+                                format!("{}...", s.chars().take(27).collect::<String>())
+                            }
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        format!("{}={}", k, val)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
+fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.rsplitn(3, '/').collect();
+    match parts.len() {
+        0 | 1 => path.to_string(),
+        2 => format!("{}/{}", parts[1], parts[0]),
+        _ => format!(".../{}/{}", parts[1], parts[0]),
+    }
+}
+fn dangerous_tools_enabled() -> bool {
+    std::env::var(DANGEROUS_TOOLS_ENV).ok().as_deref() == Some("1")
+}
+
+fn disabled_tools_from_env() -> std::collections::HashSet<String> {
+    std::env::var("HYDRA_DISABLE_TOOLS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn daemon_tool_enabled(name: &str) -> bool {
+    let disabled_tools = disabled_tools_from_env();
+    if disabled_tools.contains(name) {
+        return false;
+    }
+    match name {
+        "bash" | "write_file" | "edit_file" => dangerous_tools_enabled(),
+        _ => true,
+    }
+}
+
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(is_loopback_origin))
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE])
+}
+
+/// Middleware that updates `last_activity` timestamp on every request except
+/// GET /health and POST /shutdown (these should not prevent idle timeout).
+async fn activity_tracker_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let skip = (req.method() == Method::GET && req.uri().path() == "/health")
+        || (req.method() == Method::POST && req.uri().path() == "/shutdown");
+
+    if !skip {
+        if let Some(activity) = req.extensions().get::<Arc<std::sync::atomic::AtomicI64>>() {
+            activity.store(now_unix_ms(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    // Resolve client mode from X-Hydra-Client header
+    let client_mode = req
+        .headers()
+        .get("x-hydra-client")
+        .and_then(|v| v.to_str().ok())
+        .map(resolve_client_mode)
+        .unwrap_or(SessionMode::Ide);
+    let mut req = req;
+    req.extensions_mut().insert(client_mode);
+
+    next.run(req).await
+}
+
+/// Map X-Hydra-Client header value to SessionMode.
+/// Unknown values fall back to Ide.
+fn resolve_client_mode(header: &str) -> SessionMode {
+    match header {
+        "vscode" => SessionMode::Vscode,
+        "hydra-air" => SessionMode::AtomcodeAir,
+        _ => SessionMode::Ide,
+    }
+}
+
+fn is_loopback_origin(origin: &HeaderValue, _request_parts: &RequestParts) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+
+    is_loopback_authority(authority)
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    if let Some(rest) = authority.strip_prefix("[::1]") {
+        return rest.is_empty() || rest.starts_with(':');
+    }
+
+    let host = authority.split(':').next().unwrap_or(authority);
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+fn hash_path(path: &std::path::Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Normalize the path before hashing to ensure consistent results across:
+    // - Different path separators (Windows: `\` vs `/`)
+    // - Case sensitivity (Windows paths are case-insensitive)
+    // - Trailing slashes
+    let normalized = path.to_string_lossy();
+    let mut normalized = normalized.replace('\\', "/");
+
+    // Remove trailing slash (but keep root "/" or "C:/")
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+
+    // On Windows, paths are case-insensitive
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+
+    let mut hasher = DefaultHasher::new();
+    let normalized_path = PathBuf::from(normalized);
+    normalized_path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// List all projects (scans sessions directory)
+fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
+    let sessions_root = SessionManager::sessions_root_dir();
+    let mut projects = Vec::new();
+
+    if !sessions_root.exists() {
+        return Ok(projects);
+    }
+
+    // Scan sessions directory for actual session data
+    for entry in std::fs::read_dir(sessions_root)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            let hash = path.file_name().unwrap().to_string_lossy().to_string();
+
+            // Scan sessions in this project to get working_dir and stats
+            let mut session_count = 0;
+            let mut last_updated = 0u64;
+            let mut created_at = u64::MAX;
+            let mut working_dir = PathBuf::new();
+
+            for session_file in std::fs::read_dir(&path)? {
+                let session_file = session_file?;
+                let file_path = session_file.path();
+
+                if file_path.extension().map_or(false, |ext| ext == "json") {
+                    if let Ok(json) = std::fs::read_to_string(&file_path) {
+                        if let Ok(session) = serde_json::from_str::<Session>(&json) {
+                            session_count += 1;
+                            last_updated = last_updated.max(session.updated_at);
+                            created_at = created_at.min(session.created_at);
+                            if working_dir.to_string_lossy().is_empty() {
+                                working_dir = session.working_dir;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Only include projects with at least one session
+            if session_count > 0 {
+                let name = working_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                projects.push(ProjectInfo {
+                    hash,
+                    name,
+                    working_dir,
+                    description: None,
+                    session_count,
+                    created_at: if created_at == u64::MAX {
+                        0
+                    } else {
+                        created_at
+                    },
+                    last_updated,
+                });
+            }
+        }
+    }
+
+    // Sort by last updated (most recent first)
+    projects.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
+
+    Ok(projects)
+}
+
+/// Session metadata with project hash for cross-project listing
+#[derive(Debug, Serialize)]
+pub struct SessionMetaWithProject {
+    pub project_hash: String,
+    #[serde(flatten)]
+    pub meta: SessionMeta,
+}
+
+/// List sessions for a project
+fn list_sessions(project_hash: &str) -> std::io::Result<Vec<SessionMeta>> {
+    let project_dir = SessionManager::sessions_root_dir().join(project_hash);
+    if !project_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut sessions = Vec::new();
+
+    for entry in std::fs::read_dir(project_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().map_or(false, |ext| ext == "json") {
+            let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if let Ok(json) = std::fs::read_to_string(&path) {
+                if let Ok(session) = serde_json::from_str::<Session>(&json) {
+                    // Skip empty sessions (no messages)
+                    if session.messages.is_empty() {
+                        continue;
+                    }
+                    let mut meta = SessionMeta::from(&session);
+                    meta.file_size = file_size;
+                    sessions.push(meta);
+                }
+            }
+        }
+    }
+
+    // Sort by updated_at descending
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(sessions)
+}
+
+/// List all sessions across all projects
+fn list_all_sessions() -> std::io::Result<Vec<SessionMetaWithProject>> {
+    let sessions_root = SessionManager::sessions_root_dir();
+    if !sessions_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut all_sessions = Vec::new();
+
+    for entry in std::fs::read_dir(sessions_root)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            let project_hash = path.file_name().unwrap().to_string_lossy().to_string();
+
+            for session_file in std::fs::read_dir(&path)? {
+                let session_file = session_file?;
+                let file_path = session_file.path();
+
+                if file_path.extension().map_or(false, |ext| ext == "json") {
+                    let file_size = session_file.metadata().map(|m| m.len()).unwrap_or(0);
+                    if let Ok(json) = std::fs::read_to_string(&file_path) {
+                        if let Ok(session) = serde_json::from_str::<Session>(&json) {
+                            // Skip empty sessions (no messages)
+                            if session.messages.is_empty() {
+                                continue;
+                            }
+                            let mut meta = SessionMeta::from(&session);
+                            meta.file_size = file_size;
+                            all_sessions.push(SessionMetaWithProject {
+                                project_hash: project_hash.clone(),
+                                meta,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by updated_at descending
+    all_sessions.sort_by(|a, b| b.meta.updated_at.cmp(&a.meta.updated_at));
+    // Limit to first 50 sessions
+    all_sessions.truncate(50);
+    Ok(all_sessions)
+}
+
+/// Load a specific session
+fn load_session(project_hash: &str, session_id: &str) -> std::io::Result<Session> {
+    let path = SessionManager::sessions_root_dir()
+        .join(project_hash)
+        .join(format!("{}.json", session_id));
+
+    let json = std::fs::read_to_string(path)?;
+    serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+// ============== HTTP Handlers ==============
+
+/// Health check response
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+    pub service: &'static str,
+}
+
+/// GET /health - Health check endpoint
+async fn health() -> impl IntoResponse {
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        service: "hydra-daemon",
+    })
+}
+
+/// POST /shutdown - Trigger graceful shutdown via HTTP (R7.1, R7.2)
+async fn shutdown_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.shutdown_tx.send(true).ok();
+    Json(serde_json::json!({"success": true}))
+}
+
+/// GET /project - Get current project state
+async fn get_project_state(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.project.read().await;
+    Json(ProjectState {
+        working_dir: state.working_dir.clone(),
+        previous_dir: state.previous_dir.clone(),
+        recent_dirs: state.recent_dirs.clone(),
+        name: state.name.clone(),
+    })
+}
+
+/// POST /cd - Change working directory (like /cd command)
+async fn change_dir(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Json(req): Json<ChangeDirRequest>,
+) -> impl IntoResponse {
+    let state_clone = state.clone();
+    daemon_scope(&state, None, client_mode, || async move {
+        let state = state_clone;
+        let mut project = state.project.write().await;
+
+        // Handle "-" to go back to previous directory
+        let new_path = if req.path == "-" {
+            match &project.previous_dir {
+                Some(prev) => prev.clone(),
+                None => {
+                    return Json(ChangeDirResponse {
+                        success: false,
+                        message: "No previous directory to go back to".to_string(),
+                        current_dir: project.working_dir.clone(),
+                        project_hash: hash_path(&project.working_dir),
+                    });
+                }
+            }
+        } else {
+            // Expand ~ and make absolute
+            let expanded = if req.path.starts_with('~') {
+                hydra_core::tool::real_home_dir()
+                    .map(|h| {
+                        h.join(
+                            req.path
+                                .strip_prefix('~')
+                                .unwrap_or("")
+                                .trim_start_matches('/'),
+                        )
+                    })
+                    .unwrap_or_else(|| PathBuf::from(&req.path))
+            } else {
+                PathBuf::from(&req.path)
+            };
+
+            let resolved = if expanded.is_absolute() {
+                expanded
+            } else {
+                project.working_dir.join(&expanded)
+            };
+
+            // Check if directory exists
+            if !resolved.exists() {
+                return Json(ChangeDirResponse {
+                    success: false,
+                    message: format!("Directory does not exist: {}", resolved.display()),
+                    current_dir: project.working_dir.clone(),
+                    project_hash: hash_path(&project.working_dir),
+                });
+            }
+
+            if !resolved.is_dir() {
+                return Json(ChangeDirResponse {
+                    success: false,
+                    message: format!("Not a directory: {}", resolved.display()),
+                    current_dir: project.working_dir.clone(),
+                    project_hash: hash_path(&project.working_dir),
+                });
+            }
+
+            resolved
+        };
+
+        // Update state
+        let old_dir = project.working_dir.clone();
+        project.previous_dir = Some(old_dir);
+        project.working_dir = new_path.clone();
+        project.name = new_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string());
+
+        // Update recent dirs (max 5, deduplicated)
+        project.recent_dirs.retain(|d| d != &new_path);
+        project.recent_dirs.insert(0, new_path.clone());
+        project.recent_dirs.truncate(5);
+
+        // Persist to config
+        let config_path = Config::default_path();
+        if let Ok(mut config) = Config::load(&config_path) {
+            config.default_workdir = Some(new_path.to_string_lossy().to_string());
+            let _ = config.save(&config_path);
+        }
+
+        let hash = hash_path(&new_path);
+        state.telemetry.track(Event::UseCommand { type_: "cd".into(), success: Some(true), error_kind: None, error_data: None });
+
+        // MCP registry is loaded per-request based on working_dir, no need to reload here.
+
+        Json(ChangeDirResponse {
+            success: true,
+            message: format!("Changed to {}", new_path.display()),
+            current_dir: new_path,
+            project_hash: hash,
+        })
+    })
+    .await
+}
+
+/// GET /projects - List all projects (historical, from sessions directory)
+async fn get_projects() -> impl IntoResponse {
+    match list_projects() {
+        Ok(projects) => Json(projects).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to list projects: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
+/// GET /projects/:hash/sessions - List sessions for a project
+async fn get_project_sessions(Path(hash): Path<String>) -> impl IntoResponse {
+    match list_sessions(&hash) {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to list sessions: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
+/// GET /projects/:hash/sessions/:id - Get session detail
+async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
+    match load_session(&hash, &id) {
+        Ok(session) => {
+            let detail = SessionDetail {
+                id: session.id.to_string(),
+                name: session.name,
+                working_dir: session.working_dir,
+                created_at: session.created_at,
+                updated_at: session.updated_at,
+                message_count: session.messages.len(),
+                messages: session.messages.iter().map(MessageInfo::from).collect(),
+            };
+            Json(detail).into_response()
+        }
+        Err(e) => {
+            let msg = format!("Failed to load session: {}", e);
+            (StatusCode::NOT_FOUND, Json(msg)).into_response()
+        }
+    }
+}
+
+/// GET /sessions - List all sessions across all projects
+async fn get_all_sessions() -> impl IntoResponse {
+    match list_all_sessions() {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to list sessions: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
+/// POST /sessions - Create a new session
+async fn create_session(
+    State(state): State<AppState>,
+    Json(req): Json<CreateSessionRequest>,
+) -> impl IntoResponse {
+    // Determine working directory
+    let working_dir = match req.working_dir {
+        Some(dir) => dir,
+        None => {
+            // Use current project's working directory
+            let project = state.project.read().await;
+            project.working_dir.clone()
+        }
+    };
+
+    // Ensure working directory exists
+    if !working_dir.exists() {
+        // Create atomchat directory in user's home if default
+        let home = hydra_core::tool::real_home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let atomchat_dir = home.join("atomchat");
+        if atomchat_dir.exists() || std::fs::create_dir_all(&atomchat_dir).is_ok() {
+            // Use atomchat directory as working dir
+        } else {
+            let msg = format!("Working directory does not exist: {:?}", working_dir);
+            return (StatusCode::BAD_REQUEST, Json(msg)).into_response();
+        }
+    }
+
+    // Create session manager
+    let manager = SessionManager::new(&working_dir);
+
+    // Create new session
+    let mut session = Session::new(working_dir.clone());
+
+    // Set title if provided
+    if let Some(title) = req.title {
+        session.rename(title);
+    }
+
+    // Save session
+    if let Err(e) = manager.save(&session) {
+        let msg = format!("Failed to save session: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
+    }
+
+    // Calculate project hash for response
+    let project_hash = hash_path(&working_dir);
+
+    let response = CreateSessionResponse {
+        id: session.id.to_string(),
+        name: session.name.clone(),
+        working_dir: session.working_dir.clone(),
+        project_hash,
+        created_at: session.created_at,
+    };
+
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
+/// Search sessions by name across all projects
+fn search_sessions_by_name(keyword: &str) -> std::io::Result<Vec<SessionMetaWithProject>> {
+    let sessions_root = SessionManager::sessions_root_dir();
+    if !sessions_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let keyword_lower = keyword.to_lowercase();
+    let mut results = Vec::new();
+
+    for entry in std::fs::read_dir(sessions_root)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            let project_hash = path.file_name().unwrap().to_string_lossy().to_string();
+
+            for session_file in std::fs::read_dir(&path)? {
+                let session_file = session_file?;
+                let file_path = session_file.path();
+
+                if file_path.extension().map_or(false, |ext| ext == "json") {
+                    let file_size = session_file.metadata().map(|m| m.len()).unwrap_or(0);
+                    if let Ok(json) = std::fs::read_to_string(&file_path) {
+                        if let Ok(session) = serde_json::from_str::<Session>(&json) {
+                            // Skip empty sessions
+                            if session.messages.is_empty() {
+                                continue;
+                            }
+                            // Match keyword in session name (case-insensitive)
+                            if session.name.to_lowercase().contains(&keyword_lower) {
+                                let mut meta = SessionMeta::from(&session);
+                                meta.file_size = file_size;
+                                results.push(SessionMetaWithProject {
+                                    project_hash: project_hash.clone(),
+                                    meta,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by updated_at descending
+    results.sort_by(|a, b| b.meta.updated_at.cmp(&a.meta.updated_at));
+    Ok(results)
+}
+
+/// GET /sessions/search?q=keyword - Search sessions by name
+async fn search_sessions(Query(query): Query<SearchQuery>) -> impl IntoResponse {
+    if query.q.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json("Search keyword cannot be empty"),
+        )
+            .into_response();
+    }
+
+    match search_sessions_by_name(&query.q) {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(e) => {
+            let msg = format!("Failed to search sessions: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response()
+        }
+    }
+}
+
+/// Delete a session file
+fn delete_session_file(project_hash: &str, session_id: &str) -> std::io::Result<()> {
+    let path = SessionManager::sessions_root_dir()
+        .join(project_hash)
+        .join(format!("{}.json", session_id));
+
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Session not found: {}/{}", project_hash, session_id),
+        ));
+    }
+
+    std::fs::remove_file(path)
+}
+
+/// DELETE /projects/:hash/sessions/:id - Delete a session
+async fn delete_session(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path((hash, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        match delete_session_file(&hash, &id) {
+            Ok(()) => {
+                state_clone.telemetry.track(Event::UseCommand { type_: "delete_session".into(), success: Some(true), error_kind: None, error_data: None });
+                let msg = format!("Session {} deleted successfully", id);
+                (StatusCode::OK, Json(msg)).into_response()
+            }
+            Err(e) => {
+                let msg = format!("Failed to delete session: {}", e);
+                (StatusCode::NOT_FOUND, Json(msg)).into_response()
+            }
+        }
+    })
+    .await
+}
+
+/// Rename request body
+#[derive(Debug, Deserialize)]
+pub struct RenameRequest {
+    pub name: String,
+}
+
+/// Rename a session
+fn rename_session_file(
+    project_hash: &str,
+    session_id: &str,
+    new_name: &str,
+) -> std::io::Result<()> {
+    let path = SessionManager::sessions_root_dir()
+        .join(project_hash)
+        .join(format!("{}.json", session_id));
+
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Session not found: {}/{}", project_hash, session_id),
+        ));
+    }
+
+    // Load, rename, and save
+    let json = std::fs::read_to_string(&path)?;
+    let mut session: Session = serde_json::from_str(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    session.rename(new_name.to_string());
+
+    let manager = SessionManager::new(&PathBuf::from(&session.working_dir));
+    manager.save(&session)
+}
+
+/// PATCH /projects/:hash/sessions/:id/rename - Rename a session
+async fn rename_session(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Path((hash, id)): Path<(String, String)>,
+    Json(req): Json<RenameRequest>,
+) -> impl IntoResponse {
+    let session_uuid = uuid::Uuid::parse_str(&id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        match rename_session_file(&hash, &id, &req.name) {
+            Ok(()) => {
+                state_clone.telemetry.track(Event::UseCommand { type_: "rename".into(), success: Some(true), error_kind: None, error_data: None });
+                let msg = format!("Session {} renamed to '{}'", id, req.name);
+                (StatusCode::OK, Json(msg)).into_response()
+            }
+            Err(e) => {
+                let msg = format!("Failed to rename session: {}", e);
+                (StatusCode::NOT_FOUND, Json(msg)).into_response()
+            }
+        }
+    })
+    .await
+}
+
+/// Model info for API response
+#[derive(Debug, Serialize)]
+pub struct ModelInfo {
+    /// Provider name
+    pub provider: String,
+    /// Model identifier
+    pub model: String,
+    /// Provider type (claude, openai, ollama)
+    pub provider_type: String,
+    /// Whether this is the default provider
+    pub is_default: bool,
+}
+
+/// GET /models - List all available models from configured providers
+async fn get_models() -> impl IntoResponse {
+    let config_path = Config::default_path();
+    let config = match Config::load(&config_path) {
+        Ok(c) => c,
+        Err(_e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Vec::<ModelInfo>::new()),
+            )
+                .into_response();
+        }
+    };
+
+    let models: Vec<ModelInfo> = config
+        .providers
+        .iter()
+        .map(|(name, p)| ModelInfo {
+            provider: name.clone(),
+            model: p.model.clone(),
+            provider_type: p.provider_type.clone(),
+            is_default: name == &config.default_provider,
+        })
+        .collect();
+
+    (StatusCode::OK, Json(models)).into_response()
+}
+
+// ============== Streaming Chat API ==============
+
+/// Chat request body
+#[derive(Debug, Deserialize)]
+pub struct ChatRequest {
+    /// User message content
+    pub message: String,
+    /// Working directory (defaults to current dir)
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    /// Provider name (defaults to configured default)
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Session ID to continue (optional, creates new if not provided)
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// SSE event types for streaming chat
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum ChatEvent {
+    /// Tool batch started (all tools in this assistant turn)
+    #[serde(rename = "tool_batch")]
+    ToolBatchStarted {
+        calls: Vec<hydra_core::turn::event::ToolBatchCall>,
+    },
+    /// LLM text delta
+    #[serde(rename = "text")]
+    TextDelta { content: String },
+    /// LLM reasoning/thinking content
+    #[serde(rename = "reasoning")]
+    ReasoningDelta { content: String },
+    /// Tool call started
+    #[serde(rename = "tool_start")]
+    ToolCallStarted { id: String, name: String, arguments: String },
+    /// Real-time tool output chunk
+    #[serde(rename = "tool_output")]
+    ToolOutputChunk { chunk: String },
+    /// Tool call completed
+    #[serde(rename = "tool_result")]
+    ToolCallResult {
+        id: String,
+        name: String,
+        output: String,
+        success: bool,
+        duration_ms: u64,
+    },
+    /// Token usage update
+    #[serde(rename = "tokens")]
+    TokenUsage {
+        prompt: usize,
+        completion: usize,
+        total: usize,
+    },
+    /// Artifact started - detected code block or HTML
+    #[serde(rename = "artifact_start")]
+    ArtifactStart {
+        id: String,
+        artifact_type: String,    // "code", "html", "markdown"
+        language: Option<String>, // for code blocks
+        title: Option<String>,
+    },
+    /// Artifact content chunk
+    #[serde(rename = "artifact_content")]
+    ArtifactContent { id: String, content: String },
+    /// Artifact ended
+    #[serde(rename = "artifact_end")]
+    ArtifactEnd { id: String },
+    /// Chat completed
+    #[serde(rename = "done")]
+    Done {
+        tokens: usize,
+        tool_calls: usize,
+        session_id: String,
+    },
+    /// Chat was stopped by user
+    #[serde(rename = "stopped")]
+    Stopped,
+    /// Error occurred
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+
+/// Artifact detector for code blocks and HTML in streaming text
+struct ArtifactDetector {
+    /// Current artifact ID counter
+    artifact_counter: usize,
+    /// Current state
+    state: ArtifactDetectorState,
+}
+
+#[derive(Debug, Clone)]
+enum ArtifactDetectorState {
+    /// Normal text output
+    Normal,
+    /// Inside a code block, collecting content
+    InCodeBlock { id: String, content: String },
+    /// Inside HTML block (detected by <html>, <!DOCTYPE, or substantial HTML tags)
+    InHtml { id: String, content: String },
+    /// Inside SVG block (detected by <svg> tag)
+    InSvg { id: String, content: String },
+}
+
+impl ArtifactDetector {
+    fn new() -> Self {
+        Self {
+            artifact_counter: 0,
+            state: ArtifactDetectorState::Normal,
+        }
+    }
+
+    fn next_id(&mut self) -> String {
+        self.artifact_counter += 1;
+        format!("artifact_{}", self.artifact_counter)
+    }
+
+    /// Map code block language to artifact type for rendering
+    fn artifact_type_for_language(language: &str) -> (String, Option<String>) {
+        let lang_lower = language.to_lowercase();
+        let artifact_type = match lang_lower.as_str() {
+            // Mermaid diagrams
+            "mermaid" => "mermaid",
+            // HTML content
+            "html" | "htm" => "html",
+            // SVG graphics
+            "svg" | "xmlsvg" => "svg",
+            // Markdown content
+            "markdown" | "md" => "markdown",
+            // All other code blocks
+            _ => "code",
+        };
+        let title = if artifact_type == "code" && !language.is_empty() {
+            Some(language.to_string())
+        } else {
+            None
+        };
+        (artifact_type.to_string(), title)
+    }
+
+    /// Process incoming text delta and return events to emit
+    fn process(&mut self, text: &str) -> Vec<ChatEvent> {
+        let mut events = Vec::new();
+
+        match &mut self.state {
+            ArtifactDetectorState::Normal => {
+                // Check for code block start
+                if text.starts_with("```") {
+                    let rest = &text[3..];
+                    let end_of_line = rest.find('\n').unwrap_or(rest.len());
+                    let language = rest[..end_of_line].trim().to_string();
+
+                    let (artifact_type, title) = Self::artifact_type_for_language(&language);
+                    let id = self.next_id();
+                    events.push(ChatEvent::ArtifactStart {
+                        id: id.clone(),
+                        artifact_type,
+                        language: Some(language.clone()),
+                        title,
+                    });
+
+                    self.state = ArtifactDetectorState::InCodeBlock {
+                        id,
+                        content: String::new(),
+                    };
+                }
+                // Check for SVG block start (standalone <svg> tag)
+                else if self.is_svg_start(text) {
+                    let id = self.next_id();
+                    events.push(ChatEvent::ArtifactStart {
+                        id: id.clone(),
+                        artifact_type: "svg".to_string(),
+                        language: None,
+                        title: None,
+                    });
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+
+                    self.state = ArtifactDetectorState::InSvg {
+                        id,
+                        content: text.to_string(),
+                    };
+                }
+                // Check for HTML block start
+                else if self.is_html_start(text) {
+                    let id = self.next_id();
+                    events.push(ChatEvent::ArtifactStart {
+                        id: id.clone(),
+                        artifact_type: "html".to_string(),
+                        language: None,
+                        title: None,
+                    });
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+
+                    self.state = ArtifactDetectorState::InHtml {
+                        id,
+                        content: text.to_string(),
+                    };
+                } else {
+                    // Normal text
+                    events.push(ChatEvent::TextDelta {
+                        content: text.to_string(),
+                    });
+                }
+            }
+            ArtifactDetectorState::InCodeBlock { id, content } => {
+                // Check for code block end
+                if text.trim() == "```" {
+                    // Emit the accumulated content
+                    if !content.is_empty() {
+                        events.push(ChatEvent::ArtifactContent {
+                            id: id.clone(),
+                            content: content.clone(),
+                        });
+                    }
+                    events.push(ChatEvent::ArtifactEnd { id: id.clone() });
+                    self.state = ArtifactDetectorState::Normal;
+                } else {
+                    // Accumulate content
+                    content.push_str(text);
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                }
+            }
+            ArtifactDetectorState::InHtml { id, content } => {
+                // Check for HTML end (simple heuristic: </html> or </body>)
+                let trimmed = text.trim();
+                if trimmed.ends_with("</html>")
+                    || trimmed.ends_with("</HTML>")
+                    || trimmed.ends_with("</body>")
+                    || trimmed.ends_with("</BODY>")
+                {
+                    content.push_str(text);
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                    events.push(ChatEvent::ArtifactEnd { id: id.clone() });
+                    self.state = ArtifactDetectorState::Normal;
+                } else {
+                    content.push_str(text);
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                }
+            }
+            ArtifactDetectorState::InSvg { id, content } => {
+                // Check for SVG end (</svg> tag)
+                let trimmed = text.trim();
+                if trimmed.ends_with("</svg>") || trimmed.ends_with("</SVG>") {
+                    content.push_str(text);
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                    events.push(ChatEvent::ArtifactEnd { id: id.clone() });
+                    self.state = ArtifactDetectorState::Normal;
+                } else {
+                    content.push_str(text);
+                    events.push(ChatEvent::ArtifactContent {
+                        id: id.clone(),
+                        content: text.to_string(),
+                    });
+                }
+            }
+        }
+
+        events
+    }
+
+    fn is_html_start(&self, text: &str) -> bool {
+        let trimmed = text.trim();
+        trimmed.starts_with("<!DOCTYPE html")
+            || trimmed.starts_with("<!DOCTYPE HTML")
+            || trimmed.starts_with("<html")
+            || trimmed.starts_with("<HTML")
+    }
+
+    fn is_svg_start(&self, text: &str) -> bool {
+        let trimmed = text.trim();
+        trimmed.starts_with("<svg") || trimmed.starts_with("<SVG")
+    }
+
+    /// Finalize any pending artifact
+    fn finish(&mut self) -> Option<ChatEvent> {
+        match &self.state {
+            ArtifactDetectorState::InCodeBlock { id, .. } => {
+                let id = id.clone();
+                self.state = ArtifactDetectorState::Normal;
+                Some(ChatEvent::ArtifactEnd { id })
+            }
+            ArtifactDetectorState::InHtml { id, .. } => {
+                let id = id.clone();
+                self.state = ArtifactDetectorState::Normal;
+                Some(ChatEvent::ArtifactEnd { id })
+            }
+            ArtifactDetectorState::InSvg { id, .. } => {
+                let id = id.clone();
+                self.state = ArtifactDetectorState::Normal;
+                Some(ChatEvent::ArtifactEnd { id })
+            }
+            ArtifactDetectorState::Normal => None,
+        }
+    }
+}
+
+/// Global chat sessions store (in-memory for now)
+type SessionStore = Arc<RwLock<std::collections::HashMap<String, Conversation>>>;
+
+/// POST /chat - Stream chat response with SSE
+async fn chat_stream(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Json(mut req): Json<ChatRequest>,
+) -> impl IntoResponse {
+    // Parse session UUID for telemetry scope
+    let session_uuid = req.session_id.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    // Use current project working directory if not specified
+    if req.working_dir.is_none() {
+        let project = state.project.read().await;
+        req.working_dir = Some(project.working_dir.clone());
+    }
+
+    let (tx, rx) = mpsc::unbounded_channel::<ChatEvent>();
+
+    // Create cancellation token for this chat
+    let cancel_token = CancellationToken::new();
+
+    // Register this chat task if we have a session_id
+    let session_id = req.session_id.clone();
+    if let Some(ref sid) = session_id {
+        state
+            .chat_tasks
+            .write()
+            .await
+            .insert(sid.clone(), cancel_token.clone());
+    }
+
+    // Clone state for the spawned task
+    let chat_tasks = state.chat_tasks.clone();
+    let stopped_sessions = state.stopped_sessions.clone();
+    let mcp_cache = state.mcp_cache.clone();
+    let telemetry = state.telemetry.clone();
+
+    // Build CurrentContext for the spawned task (task_local doesn't auto-propagate across spawn)
+    // Use the request's working_dir to detect repo_origin dynamically (not the
+    // startup-time cached value), because the user may switch projects via /cd.
+    let chat_repo_origin = detect_repo_origin(
+        req.working_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."))
+    );
+    let ctx_for_task = CurrentContext {
+        mode: Some(client_mode),
+        repo_origin: Some(chat_repo_origin),
+        session_id: session_uuid,
+        ..CurrentContext::current()
+    };
+
+    // Spawn the chat processing task
+    tokio::spawn(async move {
+        CurrentContext::scope(ctx_for_task, || async move {
+            if let Err(e) = process_chat_request(
+                req,
+                tx.clone(),
+                cancel_token,
+                stopped_sessions.clone(),
+                mcp_cache,
+                telemetry,
+            )
+            .await
+            {
+                let _ = tx.send(ChatEvent::Error {
+                    message: e.to_string(),
+                });
+            }
+
+            // Cleanup: remove from chat_tasks
+            if let Some(sid) = session_id {
+                chat_tasks.write().await.remove(&sid);
+            }
+        }).await;
+    });
+
+    // Track active SSE connections for idle timeout using a Drop guard
+    // to ensure decrement happens even if the client disconnects abruptly.
+    let active_conns = state.active_connections.clone();
+    active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let stream = UnboundedReceiverStream::new(rx).map(|event| {
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(json))
+    });
+
+    // The guard must outlive the stream. We achieve this by chaining a final
+    // item that captures the guard — when the stream is dropped (client disconnect
+    // or natural end), the guard's Drop fires and decrements the counter.
+    let conn_guard = SseConnectionGuard(active_conns);
+    let guarded_stream = stream.chain(futures::stream::once(async move {
+        drop(conn_guard); // explicitly drop to decrement
+        // This event is never actually sent because the stream ends here
+        Ok(axum::response::sse::Event::default().comment("bye"))
+    }));
+
+    Sse::new(guarded_stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+/// Process a chat request and stream events
+async fn process_chat_request(
+    req: ChatRequest,
+    event_tx: mpsc::UnboundedSender<ChatEvent>,
+    cancel_token: CancellationToken,
+    stopped_sessions: StoppedSessionsStore,
+    mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
+    telemetry: Arc<Telemetry>,
+) -> anyhow::Result<()> {
+    use hydra_core::tool::{
+        bash::BashTool, edit::EditFileTool, glob::GlobTool, grep::GrepTool, list_dir::ListDirTool,
+        read::ReadFileTool, search_replace::SearchReplaceTool, todo::TodoTool,
+        web_fetch::WebFetchTool, web_search::WebSearchTool, write::WriteFileTool,
+    };
+    // Load config
+    let config_path = Config::default_path();
+    let config = Config::load(&config_path)?;
+
+    // Determine provider
+    let provider_name = req
+        .provider
+        .unwrap_or_else(|| config.default_provider.clone());
+    let provider_config = config
+        .providers
+        .get(&provider_name)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", provider_name))?;
+
+    // Create provider instance
+    let provider = provider::create_provider(provider_config)?;
+
+    // Get working directory
+    let working_dir = req
+        .working_dir
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    // Create session manager for this working directory
+    let session_manager = SessionManager::new(&working_dir);
+
+    // Load or create session
+    // Load or create session
+    let mut session = if let Some(ref session_id_str) = req.session_id {
+        // Try to load existing session
+        let session_id = SessionId::from_string(session_id_str.clone());
+        match session_manager.load(&session_id) {
+            Ok(session) => session,
+            Err(_) => {
+                // Session not found, create new one
+                Session::new(working_dir.clone())
+            }
+        }
+    } else {
+        // Create new session
+        Session::new(working_dir.clone())
+    };
+
+    // Create conversation from session messages
+    let conversation = Arc::new(tokio::sync::Mutex::new({
+        let mut conv = Conversation::new();
+        conv.messages = session.messages.clone();
+        conv
+    }));
+    conversation.lock().await.add_user_message(&req.message);
+    // Build tool registry and context — use real telemetry from AppState (R11.1, R11.2, R11.3)
+    let mut tool_context =
+        ToolContext::with_telemetry(working_dir.clone(), req.session_id.as_deref().unwrap_or("default"), telemetry);
+    let mut tool_registry = ToolRegistry::new();
+
+    if daemon_tool_enabled("read_file") {
+        tool_registry.register_sync(Box::new(ReadFileTool));
+    }
+    if daemon_tool_enabled("write_file") {
+        tool_registry.register_sync(Box::new(WriteFileTool));
+    }
+    if daemon_tool_enabled("edit_file") {
+        tool_registry.register_sync(Box::new(EditFileTool));
+    }
+    if daemon_tool_enabled("bash") {
+        tool_registry.register_sync(Box::new(BashTool));
+    }
+    if daemon_tool_enabled("grep") {
+        tool_registry.register_sync(Box::new(GrepTool));
+    }
+    if daemon_tool_enabled("glob") {
+        tool_registry.register_sync(Box::new(GlobTool));
+    }
+    if daemon_tool_enabled("list_directory") {
+        tool_registry.register_sync(Box::new(ListDirTool));
+    }
+    if daemon_tool_enabled("web_search") {
+        tool_registry.register_sync(Box::new(WebSearchTool));
+    }
+    if daemon_tool_enabled("web_fetch") {
+        tool_registry.register_sync(Box::new(WebFetchTool));
+    }
+    if daemon_tool_enabled("search_replace") {
+        tool_registry.register_sync(Box::new(SearchReplaceTool));
+    }
+    if daemon_tool_enabled("todo") {
+        tool_registry.register_sync(Box::new(TodoTool::new()));
+    }
+
+    // Load skills and register use_skill tool
+    let mut skill_registry = hydra_core::skill::SkillRegistry::new();
+    skill_registry.reload(&working_dir);
+    let has_skills = !skill_registry.is_empty();
+    let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
+    if has_skills && daemon_tool_enabled("use_skill") {
+        tool_registry.register_sync(Box::new(hydra_core::tool::use_skill::UseSkillTool {
+            registry: skill_registry.clone(),
+        }));
+    }
+
+    // Register MCP tools using per-project cache.
+    // Each project directory gets its own MCP registry (loaded from its .mcp.json + global).
+    let mcp_registry: Arc<McpRegistry> = {
+        let cache = mcp_cache.read().await;
+        if let Some(cached) = cache.get(&working_dir) {
+            cached.registry.clone()
+        } else {
+            drop(cache);
+            // Cache miss — create new registry for this project
+            let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
+            new_registry.wait_for_initial_connections(Duration::from_secs(5)).await;
+            // Store in cache
+            let mut cache = mcp_cache.write().await;
+            // Evict LRU if cache is full
+            if cache.len() >= MCP_CACHE_MAX {
+                if let Some(oldest_key) = cache
+                    .iter()
+                    .min_by_key(|(_, v)| v.last_used)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest_key);
+                }
+            }
+            cache.insert(working_dir.clone(), CachedMcpRegistry {
+                registry: new_registry.clone(),
+                last_used: std::time::Instant::now(),
+            });
+            new_registry
+        }
+    };
+    // Update last_used timestamp
+    {
+        let mut cache = mcp_cache.write().await;
+        if let Some(entry) = cache.get_mut(&working_dir) {
+            entry.last_used = std::time::Instant::now();
+        }
+    }
+    let mcp_tools = mcp_registry.list_all_tools().await;
+    if !mcp_tools.is_empty() {
+        register_mcp_tools(&mut tool_registry, mcp_registry.clone(), mcp_tools);
+    }
+
+    // Build LSP manager from config and inject into ToolContext.
+    let lsp_manager = build_lsp_manager(&config.lsp, &working_dir);
+    if lsp_manager.is_some() && daemon_tool_enabled("diagnostics") {
+        tool_registry.register_sync(Box::new(DiagnosticsTool));
+    }
+    tool_context.lsp = lsp_manager;
+
+    let shared_tools = Arc::new(tool_registry);
+
+    // API/daemon mode: no interactive approval channel. All tools (including MCP)
+    // are auto-approved. Users implicitly authorize MCP tools by configuring them
+    // in .mcp.json. This matches the CLI sub-agent behavior (BypassAll).
+    let permission = Box::new(AutoPermissionDecider::new(AutoPermissionMode::BypassAll));
+    // Same ctx selection as interactive AgentLoop: walk config.providers
+    // for the active provider, fallback to synthetic 128K config if absent.
+    let daemon_ctx = match config.providers.get(&config.default_provider) {
+        Some(pc) => hydra_core::ctx::for_provider(pc),
+        None => {
+            hydra_core::ctx::for_provider(&hydra_core::config::provider::ProviderConfig {
+                provider_type: String::new(),
+                api_key: None,
+                model: String::new(),
+                base_url: None,
+                system_prompt: None,
+                user_agent: None,
+                context_window: 128_000,
+                max_tokens: None,
+                thinking_type: None,
+                thinking_keep: None,
+                reasoning_history: None,
+                thinking_enabled: None,
+                thinking_budget: None,
+                skip_tls_verify: false,
+                ephemeral: true,
+
+})
+        }
+    };
+    let mut turn_runner = TurnRunner {
+        provider: provider.into(),
+        tools: shared_tools,
+        context: tool_context,
+        config: config.clone(),
+        ctx: daemon_ctx,
+        permission,
+        recently_edited_files: Vec::new(),
+        hook_executor: std::sync::Arc::new(hydra_core::hook::executor::HookExecutor::new(
+            hydra_core::hook::json_config::load_hooks_config(&working_dir),
+        )),
+        loop_guard: Default::default(),
+    };
+
+    // Build system prompt — aligned with TUI's AgentLoop::build_system_prompt
+    let system_prompt = build_api_system_prompt(&working_dir, &config, provider_config, &skill_registry);
+    // Create turn event channel
+    let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEvent>();
+
+    // Check if session was stopped before we started the turn loop.
+    // If so, save the current conversation (session messages + user message)
+    // and return so the user can resume from this point later.
+    let session_id_str = req.session_id.clone().unwrap_or_default();
+    if stopped_sessions
+        .write()
+        .await
+        .take(&session_id_str)
+        .is_some()
+    {
+        // Save what we have — align with TUI behaviour: a stopped
+        // conversation should still be resumable via /resume.
+        {
+            let conv = conversation.lock().await;
+            session.messages = conv.messages.clone();
+            session.auto_name_from_messages();
+            session.touch();
+            if let Err(e) = session_manager.save(&session) {
+                eprintln!("Warning: Failed to save session after early stop: {}", e);
+            }
+        }
+        let _ = event_tx.send(ChatEvent::Stopped);
+        let _ = event_tx.send(ChatEvent::Done {
+            tokens: 0,
+            tool_calls: 0,
+            session_id: session.id.to_string(),
+        });
+        return Ok(());
+    }
+
+    // Clone conversation Arc for the spawn task
+    let conversation_clone = conversation.clone();
+
+    // Capture CurrentContext so the inner spawn inherits mode/repo_origin/session_id
+    let tel_ctx = CurrentContext::current();
+
+    // Run turn(s) in background task - may need multiple turns if tools are used
+    tokio::spawn(async move {
+        CurrentContext::scope(tel_ctx, || async move {
+        let mut conv = conversation_clone.lock().await;
+
+        // Loop until LLM produces text without tool calls
+        loop {
+            let result = turn_runner
+                .run(&mut conv, &system_prompt, &turn_tx, cancel_token.clone())
+                .await;
+
+            match result {
+                TurnResult::Responded { .. } => {
+                    // LLM produced text, turn is complete
+                    break;
+                }
+                TurnResult::UsedTools { .. } => {
+                    // Truncation of tool outputs is handled inside
+                    // TurnRunner::run_with_filter now. Nothing to do
+                    // here — just loop back for the next LLM call.
+                    continue;
+                }
+                TurnResult::Failed(e) => {
+                    let _ = turn_tx.send(TurnEvent::Error(e));
+                    break;
+                }
+                TurnResult::Cancelled => {
+                    break;
+                }
+            }
+        }
+        }).await;
+    });
+
+    // Forward turn events to chat events
+    let mut total_tokens = 0usize;
+    let mut tool_call_count = 0usize;
+    let mut artifact_detector = ArtifactDetector::new();
+
+    while let Some(event) = turn_rx.recv().await {
+        match event {
+            TurnEvent::TextDelta(text) => {
+                // Process text through artifact detector
+                for chat_event in artifact_detector.process(&text) {
+                    let _ = event_tx.send(chat_event);
+                }
+            }
+            TurnEvent::ReasoningDelta(text) => {
+                // Forward reasoning/thinking content to client
+                let _ = event_tx.send(ChatEvent::ReasoningDelta { content: text });
+            }
+            TurnEvent::ToolCallStarted {
+                id,
+                name,
+                arguments,
+            } => {
+                tool_call_count += 1;
+                let _ = event_tx.send(ChatEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+
+                // Extract artifacts from write_file/edit_file tool calls
+                if name == "create_file" || name == "edit_file" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&arguments) {
+                        if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
+                            let artifact_type = if path.ends_with(".html") || path.ends_with(".htm")
+                            {
+                                "html"
+                            } else if path.ends_with(".svg") {
+                                "svg"
+                            } else {
+                                ""
+                            };
+
+                            if !artifact_type.is_empty() {
+                                if let Some(content) = args.get("content").and_then(|v| v.as_str())
+                                {
+                                    let id = format!("file-{}", uuid::Uuid::new_v4());
+                                    let title = std::path::PathBuf::from(path)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string());
+
+                                    let _ = event_tx.send(ChatEvent::ArtifactStart {
+                                        id: id.clone(),
+                                        artifact_type: artifact_type.to_string(),
+                                        language: Some("html".to_string()),
+                                        title,
+                                    });
+                                    let _ = event_tx.send(ChatEvent::ArtifactContent {
+                                        id: id.clone(),
+                                        content: content.to_string(),
+                                    });
+                                    let _ = event_tx.send(ChatEvent::ArtifactEnd { id });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            TurnEvent::ToolOutputChunk { call_id: _, chunk } => {
+                // Send real-time tool output to client
+                let _ = event_tx.send(ChatEvent::ToolOutputChunk { chunk });
+            }
+            TurnEvent::ToolCallResult {
+                call_id,
+                name,
+                output,
+                success,
+                duration,
+            } => {
+                let _ = event_tx.send(ChatEvent::ToolCallResult {
+                    id: call_id,
+                    name,
+                    output,
+                    success,
+                    duration_ms: duration.as_millis() as u64,
+                });
+            }
+            TurnEvent::TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: tt,
+                cached_tokens: _,
+            } => {
+                total_tokens = tt;
+                let _ = event_tx.send(ChatEvent::TokenUsage {
+                    prompt: prompt_tokens,
+                    completion: completion_tokens,
+                    total: tt,
+                });
+            }
+            TurnEvent::Error(e) => {
+                let _ = event_tx.send(ChatEvent::Error { message: e });
+            }
+            TurnEvent::Warning(w) => {
+                // Non-fatal advisory — surface as an Error-shaped event
+                // for now (HTTP API clients only need to see it; we're
+                // not adding a dedicated `Warning` event variant on the
+                // wire until a consumer asks for it). Prefix makes the
+                // advisory nature explicit in case a client renders the
+                // string verbatim.
+                let _ = event_tx.send(ChatEvent::Error {
+                    message: format!("[warning] {}", w),
+                });
+            }
+            TurnEvent::ContextStats { .. } => {
+                // Ignore context stats in API mode
+            }
+            TurnEvent::ToolCallStreaming { .. } => {
+                // Daemon/HTTP mode doesn't surface the "tool name streaming" phase —
+                // API clients receive the complete ToolCallStarted event when args are ready.
+            }
+            TurnEvent::ToolBatchStarted { calls, .. } => {
+                let _ = event_tx.send(ChatEvent::ToolBatchStarted { calls });
+            }
+            TurnEvent::ToolBatchCompleted { .. } => {
+                // Batch events are TUI-only display optimisations. The
+                // per-call ToolCallStarted/Result events still fire and
+                // carry the full payload that HTTP clients consume.
+            }
+            TurnEvent::WorkingDirChanged(_) => {
+                // Daemon/HTTP mode doesn't maintain a TUI footer; the shared
+                // `ctx.working_dir` was already updated in the tool. Clients
+                // that need the cwd can read it from subsequent tool output.
+            }
+            TurnEvent::ApprovalRequested { .. } => {
+                // ApprovalRequested is TUI-only (carries conversation.messages
+                // for /bg session persistence). Daemon mode handles approval
+                // via the PermissionDecider channel directly.
+            }
+        }
+    }
+
+    // Finalize any pending artifact
+    if let Some(event) = artifact_detector.finish() {
+        let _ = event_tx.send(event);
+    }
+
+    // Save session after conversation completes.
+    // If the session was stopped mid-turn, clean up the partial conversation
+    // and save it so the user can /resume from this point — same behaviour as
+    // the TUI (persist_current_session on TurnCancelled).
+    let session_id_str = req.session_id.clone().unwrap_or_default();
+    let was_stopped = stopped_sessions.read().await.contains(&session_id_str);
+
+    {
+        let mut conv = conversation.lock().await;
+        if was_stopped {
+            conv.cancel_current_turn();
+        }
+        session.messages = conv.messages.clone();
+    }
+    session.auto_name_from_messages();
+    session.touch();
+    if let Err(e) = session_manager.save(&session) {
+        eprintln!("Warning: Failed to save session: {}", e);
+    }
+
+    // Clean up stopped sessions marker if present
+    if was_stopped {
+        stopped_sessions.write().await.remove(&session_id_str);
+    }
+
+    // Send done event
+    let _ = event_tx.send(ChatEvent::Done {
+        tokens: total_tokens,
+        tool_calls: tool_call_count,
+        session_id: session.id.to_string(),
+    });
+    Ok(())
+}
+
+/// Build system prompt for daemon/API mode.
+///
+/// Aligned with TUI's `AgentLoop::build_system_prompt` to provide the same
+/// capabilities (model identity, layered instructions, memory, git snapshot,
+/// full rules). The only omission is plan mode (not applicable in API mode).
+///
+/// This function is self-contained — it does NOT touch any TUI code path.
+pub(crate) fn build_api_system_prompt(
+    working_dir: &PathBuf,
+    _config: &Config,
+    provider_config: &hydra_core::config::provider::ProviderConfig,
+    skill_registry: &Arc<std::sync::RwLock<hydra_core::skill::SkillRegistry>>,
+) -> String {
+    // Respect user's custom system_prompt override (same as TUI).
+    let rules = if let Some(custom) = provider_config.system_prompt.as_deref() {
+        custom.to_string()
+    } else {
+        hydra_core::config::prompt_sections::build_rules().to_string()
+    };
+
+    // Environment metadata
+    let shell = if cfg!(target_os = "windows") {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
+    };
+    let env_info = format!("Platform: {} | Shell: {}", std::env::consts::OS, shell);
+
+    // Identity: inject model name so the model correctly identifies itself.
+    let model_display = &provider_config.model;
+
+    // Assemble prompt: identity + env → rules LAST (recency effect).
+    let mut prompt = format!(
+        "You are Hydra. When asked who you are, say you are Hydra \
+         (an AI coding agent by AtomGit) running the {} model. \
+         Never claim to be another product.\n\
+         Working directory: {wd}\n\
+         All file paths in tool calls must be absolute, resolved under {wd}. \
+         Verify file existence before editing.\n{env_info}\n",
+        model_display,
+        wd = working_dir.display(),
+        env_info = env_info,
+    );
+
+    // Git commit attribution (Co-Authored-By trailer).
+    prompt.push_str(&format!(
+        "\n=== GIT COMMITS ===\n\
+         When you create a git commit on the user's behalf, end the commit \
+         message with this trailer (preceded by a blank line):\n\
+         \n\
+         Co-Authored-By: Hydra ({}) <noreply@atomgit.com>\n\
+         \n\
+         Use a HEREDOC for `git commit -m` so the trailer's blank line is \
+         preserved verbatim. Skip this trailer for `git commit --amend` \
+         and `git revert` (those operate on existing commits whose \
+         attribution shouldn't change).\n",
+        model_display
+    ));
+
+    // Layered instructions (global → project → user).
+    // Pure file reads, no side effects, < 1ms.
+    let instructions = hydra_core::config::instructions::LayeredInstructions::load(working_dir);
+    let merged_instructions = instructions.merged();
+    if !merged_instructions.is_empty() {
+        prompt.push_str(&format!("\n{}\n", merged_instructions));
+    }
+
+    // Persistent memory (global + project).
+    // Pure file reads, no side effects.
+    {
+        use hydra_core::config::memory::MemoryStore;
+        let project_name = working_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string());
+        let global = MemoryStore::global();
+        let project = MemoryStore::project(working_dir);
+        let memory_block = MemoryStore::merged_for_prompt(&global, &project, &project_name);
+        if !memory_block.is_empty() {
+            prompt.push_str(&format!("\n{}\n", memory_block));
+        }
+    }
+
+    // Available skills
+    if let Ok(registry) = skill_registry.read() {
+        let skills: Vec<String> = registry
+            .invocable_by_llm()
+            .map(|s| {
+                let hint = s
+                    .argument_hint
+                    .as_ref()
+                    .map(|h| format!(" {}", h))
+                    .unwrap_or_default();
+                format!("- /{}{}: {}", s.name, hint, s.description)
+            })
+            .collect();
+        if !skills.is_empty() {
+            prompt.push_str("\n=== AVAILABLE SKILLS ===\n");
+            prompt.push_str(
+                "Use the `use_skill` tool to invoke a skill when relevant to the task.\n",
+            );
+            prompt.push_str(&skills.join("\n"));
+            prompt.push('\n');
+        }
+    }
+
+    // Git snapshot (branch / HEAD / status).
+    // Blocking I/O (~30ms) — acceptable per chat request since this runs once
+    // at prompt construction time, not on a hot path.
+    let env_snapshot = hydra_core::ctx::EnvSnapshot::capture(working_dir);
+    prompt.push_str(&env_snapshot.as_prompt_section());
+
+    // RULES GO LAST — recency effect ensures the model remembers these.
+    prompt.push_str(&format!(
+        "\n=== RULES (follow these strictly) ===\n{rules}\n"
+    ));
+
+    // Platform-specific rules (Windows path conventions, etc.)
+    let platform = hydra_core::config::platform_rules();
+    if !platform.is_empty() {
+        prompt.push_str(platform);
+        prompt.push('\n');
+    }
+
+    prompt
+}
+
+/// Request to stop a chat session
+#[derive(Debug, Deserialize)]
+struct StopChatRequest {
+    session_id: String,
+}
+
+/// Response for stop chat request
+#[derive(Debug, Serialize)]
+struct StopChatResponse {
+    success: bool,
+    message: String,
+}
+
+/// POST /chat/stop - Stop a running chat session
+async fn stop_chat(
+    State(state): State<AppState>,
+    axum::Extension(client_mode): axum::Extension<SessionMode>,
+    Json(req): Json<StopChatRequest>,
+) -> impl IntoResponse {
+    let session_uuid = uuid::Uuid::parse_str(&req.session_id).ok();
+    let state_clone = state.clone();
+    daemon_scope(&state, session_uuid, client_mode, || async move {
+        // Add to stopped sessions set
+        state_clone
+            .stopped_sessions
+            .write()
+            .await
+            .insert(req.session_id.clone());
+
+        // Cancel the chat task if it exists
+        if let Some(cancel_token) = state_clone.chat_tasks.read().await.get(&req.session_id) {
+            cancel_token.cancel();
+            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
+            (
+                axum::http::StatusCode::OK,
+                Json(StopChatResponse {
+                    success: true,
+                    message: format!("Chat session {} stopped", req.session_id),
+                }),
+            )
+        } else {
+            // Session wasn't running, but we marked it as stopped
+            state_clone.telemetry.track(Event::UseCommand { type_: "stop".into(), success: Some(true), error_kind: None, error_data: None });
+            (
+                axum::http::StatusCode::OK,
+                Json(StopChatResponse {
+                    success: true,
+                    message: format!(
+                        "Chat session {} marked as stopped (was not running)",
+                        req.session_id
+                    ),
+                }),
+            )
+        }
+    })
+    .await
+}
+
+/// GET /chat/active - Return list of session IDs currently generating
+async fn active_chat_sessions(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let sessions: Vec<String> = state.chat_tasks.read().await.keys().cloned().collect();
+    Json(sessions)
+}
+
+// --- MCP API handlers ---
+
+#[derive(Serialize)]
+struct McpServerStatus {
+    name: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct McpStatusResponse {
+    servers: Vec<McpServerStatus>,
+}
+
+async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
+    let registry = state.mcp_registry.read().await.clone();
+    let statuses = registry.server_statuses().await;
+    let mut servers = Vec::new();
+    for (name, status) in statuses {
+        let (status_str, error) = match &status {
+            hydra_core::mcp::ServerStatus::Connecting => ("connecting".to_string(), None),
+            hydra_core::mcp::ServerStatus::Connected => ("connected".to_string(), None),
+            hydra_core::mcp::ServerStatus::Failed(e) => ("error".to_string(), Some(e.clone())),
+            hydra_core::mcp::ServerStatus::Disconnected => ("disconnected".to_string(), None),
+        };
+        let tool_count = if matches!(status, hydra_core::mcp::ServerStatus::Connected) {
+            let tools = registry.list_all_tools().await;
+            Some(tools.iter().filter(|t| t.server_name == name).count())
+        } else {
+            None
+        };
+        servers.push(McpServerStatus {
+            name,
+            status: status_str,
+            tool_count,
+            error,
+        });
+    }
+    Json(McpStatusResponse { servers })
+}
+
+async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let project = state.project.read().await;
+    let project_dir = project.working_dir.clone();
+    drop(project);
+    let new_registry = McpRegistry::from_config_background(&project_dir);
+    *state.mcp_registry.write().await = Arc::new(new_registry);
+    Json(serde_json::json!({"status": "reloading"}))
+}
+
+/// Wait for the first shutdown signal (Ctrl-C, SIGTERM on Unix, or watch channel).
+/// Once received, log and return so that `axum::serve(...).with_graceful_shutdown(...)`
+/// can begin draining in-flight connections. (R10.1, R7.2, R7.3)
+async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    let http_shutdown = async {
+        // Wait until the watch channel value becomes true (sent by POST /shutdown)
+        while !*shutdown_rx.borrow_and_update() {
+            if shutdown_rx.changed().await.is_err() {
+                // Sender dropped — treat as shutdown
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => { tracing::info!("Received Ctrl-C, starting graceful shutdown"); }
+        _ = terminate => { tracing::info!("Received SIGTERM, starting graceful shutdown"); }
+        _ = http_shutdown => { tracing::info!("Received /shutdown request, starting graceful shutdown"); }
+    }
+}
+
+/// Install a panic hook that emits a scrubbed `Event::Panic` telemetry event
+/// before delegating to the default hook (preserving stderr output). (R9.1-R9.4)
+fn install_panic_hook(telemetry: Arc<Telemetry>) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let home = hydra_telemetry::identity::real_home_dir();
+        let cwd = std::env::current_dir().ok();
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".into());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let scrubbed_loc =
+            hydra_telemetry::scrub::scrub_path(&loc, home.as_deref(), cwd.as_deref());
+        let scrubbed_msg = hydra_telemetry::scrub::truncate_head(
+            &hydra_telemetry::scrub::scrub_path(&msg, home.as_deref(), cwd.as_deref()),
+            hydra_telemetry::scrub::HEAD_MAX,
+        );
+        let frames =
+            hydra_telemetry::scrub::backtrace_top_k(&bt, 5, home.as_deref(), cwd.as_deref());
+        telemetry.track(Event::Panic {
+            location: scrubbed_loc,
+            message_head: scrubbed_msg,
+            thread: std::thread::current().name().unwrap_or("unknown").into(),
+            backtrace_top_5: frames,
+            error_kind: Some("panic".to_string()),
+            error_data: Some(serde_json::json!({
+                "session_duration_secs": telemetry.uptime().as_secs() as u32,
+                "turns_completed": null,
+                "last_tool_name": null,
+                "last_event": null,
+            }).to_string()),
+        });
+        default_hook(info); // R9.4: preserve stderr output
+    }));
+}
+
+/// Default idle timeout: 30 minutes (in seconds). Set to 0 to disable.
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Get current unix timestamp in milliseconds.
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Spawn a background task that checks for idle timeout and triggers shutdown.
+fn spawn_idle_timeout_task(
+    idle_timeout_secs: u64,
+    last_activity: Arc<std::sync::atomic::AtomicI64>,
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    shutdown_tx: watch::Sender<bool>,
+) {
+    if idle_timeout_secs == 0 {
+        return; // Disabled
+    }
+    let timeout_ms = (idle_timeout_secs * 1000) as i64;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.tick().await; // consume immediate first tick
+        loop {
+            interval.tick().await;
+            let conns = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            if conns > 0 {
+                continue; // Active streaming connections, not idle
+            }
+            let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
+            let elapsed = now_unix_ms() - last;
+            if elapsed >= timeout_ms {
+                tracing::info!(
+                    elapsed_mins = elapsed / 60_000,
+                    timeout_mins = idle_timeout_secs / 60,
+                    "Daemon idle timeout reached, shutting down"
+                );
+                shutdown_tx.send(true).ok();
+                break;
+            }
+        }
+    });
+}
+
+fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
+    const DEFAULT_HOST: &str = "127.0.0.1";
+    const DEFAULT_PORT: u16 = 13456;
+
+    let mut host: Option<String> = None;
+    let mut port: Option<u16> = None;
+    let mut no_telemetry = false;
+    let mut idle_timeout: Option<u64> = None;
+    let mut client_mode: Option<String> = None;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--host" {
+            if let Some(value) = args.next() {
+                host = Some(value);
+            }
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--host=") {
+            host = Some(value.to_string());
+            continue;
+        }
+
+        if arg == "--port" {
+            if let Some(value) = args.next() {
+                port = value.parse().ok();
+            }
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--port=") {
+            port = value.parse().ok();
+            continue;
+        }
+
+        if arg == "--no-telemetry" {
+            no_telemetry = true;
+            continue;
+        }
+
+        if arg == "--idle-timeout" {
+            if let Some(value) = args.next() {
+                idle_timeout = value.parse().ok();
+            }
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--idle-timeout=") {
+            idle_timeout = value.parse().ok();
+            continue;
+        }
+
+        if arg == "--client" {
+            if let Some(value) = args.next() {
+                client_mode = Some(value);
+            }
+            continue;
+        }
+
+        if let Some(value) = arg.strip_prefix("--client=") {
+            client_mode = Some(value.to_string());
+            continue;
+        }
+    }
+
+    let cli_override = if no_telemetry {
+        CliOverride { disabled: true }
+    } else {
+        CliOverride::default()
+    };
+
+    // Allow env var override: HYDRA_DAEMON_IDLE_TIMEOUT=<seconds>
+    // 0 = disabled; non-zero values are clamped to a minimum of 60s to prevent
+    // accidental rapid cycling from misconfigured environments.
+    let raw_timeout = idle_timeout
+        .or_else(|| std::env::var("HYDRA_DAEMON_IDLE_TIMEOUT").ok()?.parse().ok())
+        .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+    let timeout = if raw_timeout == 0 { 0 } else { raw_timeout.max(60) };
+
+    let mode = match client_mode.as_deref() {
+        Some("vscode") => SessionMode::Vscode,
+        Some("hydra-air") => SessionMode::AtomcodeAir,
+        _ => SessionMode::Ide,
+    };
+
+    (host.unwrap_or_else(|| DEFAULT_HOST.to_string()), port.unwrap_or(DEFAULT_PORT), cli_override, timeout, mode)
+}
+
+#[tokio::main]
+async fn main() {
+    use axum::routing::patch;
+
+    // On Windows, when built as a GUI-subsystem binary (windows_subsystem = "windows"),
+    // there is no default console. If launched from a terminal (cmd.exe / PowerShell),
+    // re-attach to the parent's console so eprintln!/tracing output is visible.
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
+    }
+
+    // Ensure legacy sessions (macOS pre-v4.16 ~/Library/Application Support/hydra/sessions)
+    // are migrated to the canonical location ($HYDRA_HOME/sessions) before any handler reads it.
+    SessionManager::migrate_from_legacy();
+
+    // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default
+    let cfg_telemetry = match Config::load(&Config::default_path()) {
+        Ok(c) => c.telemetry,
+        Err(e) => {
+            tracing::warn!(?e, "Failed to load config, using defaults");
+            hydra_telemetry::TelemetryConfig::default()
+        }
+    };
+
+    // Step 2: Resolve telemetry state (R1.2, R2.1-R2.3, R2.5)
+    let (host, port, cli_override, idle_timeout_secs, startup_mode) = parse_daemon_args();
+    let resolved = resolve(&cfg_telemetry, &cli_override, Config::config_dir(), &ProcessEnv);
+
+    // Step 3: Print telemetry status line (R2.6)
+    match &resolved.state {
+        TelemetryState::Enabled => println!("Telemetry: enabled"),
+        TelemetryState::Disabled(reason) => println!("Telemetry: disabled (reason: {})", reason),
+    }
+
+    // Step 4: Initialize telemetry runtime (R1.3, R1.6)
+    let telemetry = Telemetry::init(resolved, env!("CARGO_PKG_VERSION").into());
+
+    // Step 4.5: Install panic hook (R9.1, R9.2, R9.3, R9.4)
+    install_panic_hook(telemetry.clone());
+
+    // Step 5: Precompute repo_origin (R4.2)
+    // Use the project working directory (from config or cwd) rather than the
+    // raw process cwd, because VS Code may spawn the daemon with a cwd that
+    // is not inside a git repository (e.g. the extension install directory).
+    let project_state = init_project_state();
+    let repo_origin = detect_repo_origin(&project_state.working_dir);
+
+    // Step 6: Seed account_id from stored auth (R4.3)
+    telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id));
+
+    // Initialize MCP registry from project working directory config
+    // This reads both $HYDRA_HOME/mcp.json (user-level) and <project>/.mcp.json (project-level)
+    let mcp_registry = McpRegistry::from_config_background(&project_state.working_dir);
+
+    // Step 7: Build AppState (R1.4)
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(now_unix_ms()));
+    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>> = Arc::new(RwLock::new(HashMap::new()));
+    let state = AppState {
+        sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        project: Arc::new(RwLock::new(project_state)),
+        chat_tasks: Arc::new(RwLock::new(HashMap::new())),
+        stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
+        mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
+        mcp_cache: mcp_cache.clone(),
+        login_sessions: Arc::new(RwLock::new(HashMap::new())),
+        telemetry: telemetry.clone(),
+        repo_origin: repo_origin.clone(),
+        shutdown_tx: shutdown_tx.clone(),
+        last_activity: last_activity.clone(),
+        active_connections: active_connections.clone(),
+        agent_registry: Arc::new(api_agent::AgentRegistry::new(mcp_cache.clone())),
+    };
+
+    let app = Router::new()
+        // Health check
+        .route("/health", get(health))
+        // Shutdown endpoint (R7.1)
+        .route("/shutdown", post(shutdown_handler))
+        // Session APIs
+        .route("/sessions", get(get_all_sessions).post(create_session))
+        .route("/sessions/search", get(search_sessions))
+        // Current project state (working directory)
+        .route("/project", get(get_project_state))
+        .route("/cd", post(change_dir))
+        // Historical projects (from sessions directory)
+        .route("/projects", get(get_projects))
+        .route("/projects/:hash/sessions", get(get_project_sessions))
+        .route(
+            "/projects/:hash/sessions/:id",
+            get(get_session_detail).delete(delete_session),
+        )
+        .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
+        // Model API
+        .route("/models", get(get_models))
+        // Chat API
+        .route("/chat", post(chat_stream))
+        .route("/chat/stop", post(stop_chat))
+        .route("/chat/active", get(active_chat_sessions))
+        // MCP API
+        .route("/mcp/status", get(mcp_status))
+        .route("/mcp/reload", post(mcp_reload))
+        // Config API (P0)
+        .route("/config", get(api_config::get_config))
+        .route("/config/reload", post(api_config::reload_config))
+        // Provider API (P0)
+        .route(
+            "/providers",
+            get(api_provider::get_providers).post(api_provider::create_provider),
+        )
+        .route(
+            "/providers/:name",
+            patch(api_provider::patch_provider).delete(api_provider::delete_provider),
+        )
+        .route(
+            "/providers/:name/default",
+            post(api_provider::set_default_provider),
+        )
+        .route(
+            "/providers/:name/thinking",
+            patch(api_provider::patch_thinking),
+        )
+        // Auth API (P0)
+        .route("/auth/status", get(api_auth::auth_status))
+        .route("/auth/login/start", post(api_auth::auth_login_start))
+        .route(
+            "/auth/login/:login_id/poll",
+            post(api_auth::auth_login_poll),
+        )
+        .route("/auth/login/:login_id", delete(api_auth::auth_login_cancel))
+        .route("/auth/logout", post(api_auth::auth_logout))
+        // CodingPlan API (P0)
+        .route("/codingplan/setup", post(api_codingplan::codingplan_setup))
+        .route("/api/v1/agents", get(api_agent::list_agents).post(api_agent::create_agent))
+        .route("/api/v1/agents/:id", get(api_agent::get_agent))
+        .route("/api/v1/agents/:id/commands", post(api_agent::post_agent_command))
+        .route("/api/v1/agents/:id/events", get(api_agent::list_agent_events))
+        .route("/api/v1/agents/:id/events/stream", get(api_agent::stream_agent_events))
+        .route("/api/v1/worktrees", get(api_worktree::list_worktrees).post(api_worktree::create_worktree))
+        .route("/api/v1/worktrees/:id", delete(api_worktree::delete_worktree))
+        .route("/api/v1/branches", get(api_branch::list_branches).post(api_branch::create_branch))
+        .route("/api/v1/branches/:name", delete(api_branch::delete_branch))
+        .with_state(state)
+        .layer(axum::middleware::from_fn(activity_tracker_middleware))
+        .layer(axum::Extension(last_activity.clone()))
+        .layer(cors_layer());
+
+    // Spawn idle timeout watchdog task
+    spawn_idle_timeout_task(
+        idle_timeout_secs,
+        last_activity,
+        active_connections,
+        shutdown_tx,
+    );
+    if idle_timeout_secs > 0 {
+        println!("Idle timeout: {} minutes", idle_timeout_secs / 60);
+    } else {
+        println!("Idle timeout: disabled");
+    }
+
+    // Default to loopback-only for security. The daemon hosts chat / file-edit /
+    // tool-execution endpoints that should not be reachable from another host on
+    // the LAN without explicit configuration (PR #82 briefly broke this by
+    // hard-coding 0.0.0.0; see commit `tianchang fix(daemon): harden daemon chat
+    // access` for the original loopback-default rationale).
+    //
+    // Users can override the bind address via --host <ip>. When binding a
+    // non-loopback address, a security warning is printed. For production use,
+    // consider running a reverse proxy in front instead.
+    let addr = format!("{host}:{port}");
+    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+        eprintln!(
+            "Warning: binding to non-loopback address '{}'. \
+            The daemon exposes sensitive endpoints (chat, file-edit, tool-execution). \
+            Ensure the network is trusted or use a reverse proxy with authentication.",
+            host
+        );
+    }
+    println!("Hydra API server listening on http://{}", addr);
+    if dangerous_tools_enabled() {
+        eprintln!(
+            "Warning: {}=1 enables bash and write-capable daemon tools.",
+            DANGEROUS_TOOLS_ENV
+        );
+    }
+    println!("\nAPI endpoints:");
+    println!("  GET    /health                        - Health check");
+    println!("  GET    /project                        - Get current working directory");
+    println!(
+        "  POST   /cd                             - Change working directory (like /cd command)"
+    );
+    println!("  GET    /projects                       - List historical projects");
+    println!("  GET    /projects/:hash/sessions        - List sessions in a project");
+    println!("  GET    /projects/:hash/sessions/:id    - Get session detail");
+    println!("  DELETE /projects/:hash/sessions/:id    - Delete a session");
+    println!("  PATCH  /projects/:hash/sessions/:id/rename - Rename a session");
+    println!("  GET    /sessions                       - List all sessions (cross-project)");
+    println!("  GET    /sessions/search?q=<keyword>    - Search sessions by name");
+    println!("  GET    /models                         - List available models");
+    println!("  POST   /chat                           - Stream chat response (SSE)");
+    println!("  GET    /config                         - Get sanitized config");
+    println!("  POST   /config/reload                  - Reload config from disk");
+    println!("  GET    /providers                      - List providers");
+    println!("  POST   /providers                      - Create/replace provider");
+    println!("  PATCH  /providers/:name                - Partially update provider");
+    println!("  DELETE /providers/:name                - Delete provider");
+    println!("  POST   /providers/:name/default        - Set default provider");
+    println!("  PATCH  /providers/:name/thinking       - Update thinking settings");
+    println!("  GET    /auth/status                    - Auth status");
+    println!("  POST   /auth/login/start               - Start OAuth login");
+    println!("  POST   /auth/login/:login_id/poll      - Poll login session");
+    println!("  DELETE /auth/login/:login_id           - Cancel login session");
+    println!("  POST   /auth/logout                    - Logout");
+    println!("  POST   /codingplan/setup               - Run CodingPlan setup");
+    println!("\nChange directory body:");
+    println!("  {{\"path\": \"/path/to/project\"}}  or {{\"path\": \"-\"}} to go back");
+    println!("\nChat request body:");
+    println!("  {{\"message\": \"your question\", \"provider\": \"optional\"}}");
+
+    // Step 9: Bind listener (R4.1 gate)
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Fatal: failed to bind to {}: {}", addr, e);
+            // Step 12: On bind failure, still emit OpenAtomcode (R4.4) then exit
+            CurrentContext::scope(
+                CurrentContext {
+                    mode: Some(startup_mode),
+                    repo_origin: Some(repo_origin.clone()),
+                    session_id: None,
+                    ..CurrentContext::default()
+                },
+                || async {
+                    telemetry.track(Event::OpenAtomcode);
+                },
+            )
+            .await;
+            telemetry.shutdown(Duration::from_millis(500)).await;
+            std::process::exit(1);
+        }
+    };
+
+    // Steps 10-11: Enter CurrentContext scope and emit OpenAtomcode (R4.1, R4.2)
+    CurrentContext::scope(
+        CurrentContext {
+            mode: Some(startup_mode),
+            repo_origin: Some(repo_origin.clone()),
+            session_id: None,
+            ..CurrentContext::default()
+        },
+        || async {
+            telemetry.track(Event::OpenAtomcode);
+        },
+    )
+    .await;
+
+    // Step 13: Serve with graceful shutdown (R10.1-R10.5)
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .await
+        .unwrap_or_else(|e| tracing::error!(?e, "axum::serve error"));
+
+    // Step 14: Final telemetry flush before process exit (R10.2-R10.5)
+    telemetry.shutdown(Duration::from_millis(500)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use hydra_telemetry::{RepoHost, ResolvedConfig};
+    use serial_test::serial;
+    use tower::util::ServiceExt;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let old = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(old) = &self.old {
+                std::env::set_var(self.key, old);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn disabled_telemetry_for_tests(home: PathBuf) -> Arc<Telemetry> {
+        Telemetry::init(
+            ResolvedConfig {
+                state: TelemetryState::Disabled("test"),
+                endpoint: "http://localhost/v1/events".into(),
+                hydra_dir: home,
+            },
+            env!("CARGO_PKG_VERSION").to_string(),
+        )
+    }
+
+    fn test_app_state(project_dir: PathBuf, telemetry_home: PathBuf) -> AppState {
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>> = Arc::new(RwLock::new(HashMap::new()));
+        AppState {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            project: Arc::new(RwLock::new(ProjectState {
+                name: project_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "project".to_string()),
+                working_dir: project_dir.clone(),
+                previous_dir: None,
+                recent_dirs: vec![project_dir.clone()],
+            })),
+            chat_tasks: Arc::new(RwLock::new(HashMap::new())),
+            stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
+            mcp_registry: Arc::new(RwLock::new(Arc::new(McpRegistry::new()))),
+            mcp_cache: mcp_cache.clone(),
+            login_sessions: Arc::new(RwLock::new(HashMap::new())),
+            telemetry: disabled_telemetry_for_tests(telemetry_home),
+            repo_origin: RepoOrigin {
+                host: RepoHost::None,
+                has_git: false,
+            },
+            shutdown_tx,
+            last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            active_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            agent_registry: Arc::new(api_agent::AgentRegistry::new(mcp_cache.clone())),
+        }
+    }
+
+    fn test_router(state: AppState) -> Router {
+        Router::new()
+            .route("/sessions", get(get_all_sessions).post(create_session))
+            .route(
+                "/projects/:hash/sessions/:id",
+                get(get_session_detail),
+            )
+            .with_state(state)
+    }
+
+    fn origin_is_allowed(origin: &str) -> bool {
+        let origin = HeaderValue::from_str(origin).unwrap();
+        let request = axum::http::Request::builder().body(()).unwrap();
+        let (parts, _) = request.into_parts();
+        is_loopback_origin(&origin, &parts)
+    }
+
+    #[test]
+    fn cors_allows_loopback_origins() {
+        assert!(origin_is_allowed("http://localhost:3000"));
+        assert!(origin_is_allowed("http://127.0.0.1:3000"));
+        assert!(origin_is_allowed("http://[::1]:3000"));
+        assert!(origin_is_allowed("https://localhost"));
+    }
+
+    #[test]
+    fn cors_rejects_remote_and_opaque_origins() {
+        assert!(!origin_is_allowed("http://192.168.1.10:3000"));
+        assert!(!origin_is_allowed("http://localhost.evil.example"));
+        assert!(!origin_is_allowed("null"));
+        assert!(!origin_is_allowed("file://local/index.html"));
+    }
+
+    #[test]
+    #[serial]
+    fn dangerous_tools_require_opt_in_even_when_not_disabled() {
+        let _dangerous = EnvVarGuard::unset(DANGEROUS_TOOLS_ENV);
+        let _disabled = EnvVarGuard::unset("HYDRA_DISABLE_TOOLS");
+
+        assert!(daemon_tool_enabled("read_file"));
+        assert!(daemon_tool_enabled("grep"));
+        assert!(!daemon_tool_enabled("bash"));
+        assert!(!daemon_tool_enabled("write_file"));
+        assert!(!daemon_tool_enabled("edit_file"));
+    }
+
+    #[test]
+    #[serial]
+    fn dangerous_tools_can_be_enabled_but_disable_list_still_wins() {
+        let _dangerous = EnvVarGuard::set(DANGEROUS_TOOLS_ENV, "1");
+        let _disabled = EnvVarGuard::set("HYDRA_DISABLE_TOOLS", "bash,write_file");
+
+        assert!(daemon_tool_enabled("read_file"));
+        assert!(!daemon_tool_enabled("bash"));
+        assert!(!daemon_tool_enabled("write_file"));
+        assert!(daemon_tool_enabled("edit_file"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sessions_endpoint_creates_and_persists_session_under_hydra_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hydra_home = temp.path().join("hydra-home");
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let _home_guard = EnvVarGuard::set("HYDRA_HOME", hydra_home.to_str().expect("utf8 path"));
+
+        let app = test_router(test_app_state(project_dir.clone(), hydra_home.clone()));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/sessions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "working_dir": project_dir,
+                    "title": "contract-smoke"
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let response = app.oneshot(request).await.expect("router response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let created: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse create session response");
+        assert_eq!(created["name"], "contract-smoke");
+        let created_id = created["id"]
+            .as_str()
+            .expect("session id string")
+            .to_string();
+
+        let sessions_root = SessionManager::sessions_root_dir();
+        assert!(sessions_root.starts_with(&hydra_home));
+        let expected_project_hash = hash_path(&temp.path().join("project"));
+        assert_eq!(created["project_hash"], expected_project_hash);
+
+        let manager = SessionManager::new(&temp.path().join("project"));
+        let session_id = SessionId::from_string(created_id.clone());
+        let stored = manager.load(&session_id).expect("load persisted session");
+        assert_eq!(stored.name, "contract-smoke");
+        let loaded_by_hash = load_session(
+            created["project_hash"].as_str().expect("project hash"),
+            &created_id,
+        )
+        .expect("load session by project hash");
+        assert_eq!(loaded_by_hash.id.to_string(), created_id);
+
+        let project_dirs: Vec<_> = std::fs::read_dir(&sessions_root)
+            .expect("read sessions root")
+            .map(|entry| entry.expect("dir entry").file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(project_dirs, vec![expected_project_hash.clone()]);
+
+        let detail_response = get_session_detail(Path((
+            created["project_hash"].as_str().expect("project hash").to_string(),
+            created_id.clone(),
+        )))
+        .await
+        .into_response();
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .expect("read detail body");
+        let detail: serde_json::Value =
+            serde_json::from_slice(&detail_body).expect("parse session detail");
+        assert_eq!(detail["id"], created["id"]);
+        assert_eq!(detail["name"], "contract-smoke");
+        assert_eq!(detail["message_count"], 0);
+    }
+
+    fn test_router_with_agents(state: AppState) -> Router {
+        Router::new()
+            .route("/api/v1/agents", get(api_agent::list_agents).post(api_agent::create_agent))
+            .route("/api/v1/agents/:id", get(api_agent::get_agent))
+            .route("/api/v1/agents/:id/commands", post(api_agent::post_agent_command))
+            .route("/api/v1/agents/:id/events", get(api_agent::list_agent_events))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn agent_smoke_create_list_start_events() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hydra_home = temp.path().join("hydra-home");
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let _home_guard = EnvVarGuard::set("HYDRA_HOME", hydra_home.to_str().expect("utf8 path"));
+
+        let app = test_router_with_agents(test_app_state(project_dir.clone(), hydra_home.clone()));
+
+        // 1. Create agent
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/agents")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "name": "smoke-agent",
+                    "working_dir": project_dir.to_str().unwrap()
+                })
+                .to_string(),
+            ))
+            .expect("build create request");
+        let response = app.clone().oneshot(create_req).await.expect("create agent");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let created: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        let agent_id = created["agent"]["id"].as_str().expect("agent id").to_string();
+        assert_eq!(created["agent"]["name"], "smoke-agent");
+        assert_eq!(created["agent"]["status"], "created");
+
+        // 2. List agents — should include the new agent
+        let list_req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/agents")
+            .body(Body::empty())
+            .expect("build list request");
+        let response = app.clone().oneshot(list_req).await.expect("list agents");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let list: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        let items = list["items"].as_array().expect("items array");
+        assert!(items.iter().any(|a| a["id"] == agent_id));
+
+        // 3. Get agent detail
+        let get_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/agents/{}", agent_id))
+            .body(Body::empty())
+            .expect("build get request");
+        let response = app.clone().oneshot(get_req).await.expect("get agent");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let detail: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(detail["agent"]["status"], "created");
+
+        // 4. Start agent — triggers mock progression fallback (no real provider config)
+        let start_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/agents/{}/commands", agent_id))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"type": "start"}).to_string(),
+            ))
+            .expect("build start request");
+        let response = app.clone().oneshot(start_req).await.expect("start agent");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let cmd_resp: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(cmd_resp["accepted"], true);
+        assert_eq!(cmd_resp["status_before"], "created");
+        assert_eq!(cmd_resp["status_after"], "queued");
+
+        // 5. Wait for mock progression to complete (100ms sleep + status changes)
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // 6. Verify agent reached completed state
+        let get_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/agents/{}", agent_id))
+            .body(Body::empty())
+            .expect("build get request");
+        let response = app.clone().oneshot(get_req).await.expect("get agent");
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let detail: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(detail["agent"]["status"], "completed");
+
+        // 7. Check events exist
+        let events_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/agents/{}/events?after_seq=0&limit=10", agent_id))
+            .body(Body::empty())
+            .expect("build events request");
+        let response = app.clone().oneshot(events_req).await.expect("get events");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let events: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        let evt_items = events["items"].as_array().expect("events array");
+        assert!(!evt_items.is_empty(), "should have at least one event");
+        let has_status = evt_items
+            .iter()
+            .any(|e| e["event_type"] == "status_changed");
+        assert!(has_status, "should have status_changed events");
+    }
+}

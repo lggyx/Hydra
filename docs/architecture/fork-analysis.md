@@ -95,7 +95,7 @@
 | 10+ LLM providers | ✅ OpenAI, Anthropic, DeepSeek, etc. | Hydra needs 3-4 providers initially |
 | WASM sandboxed tools | ✅ | Hydra uses native Rust tools (more powerful for code editing) |
 | Memory backends | ✅ | Not a Hydra priority (Hydra uses git for memory) |
-| Sliding window context | ✅ | Hydra uses atomcode's hot/cold context strategy |
+| Sliding window context | ✅ | Hydra uses hydra's hot/cold context strategy |
 
 **Verdict**: Do not fork. AutoAgents solves a different problem (generic agent framework). Hydra's value is in the code-generation-specific layers (git worktree isolation + LLM-driven scheduling + tool scoping). AutoAgents' Agent trait could inform Hydra's design, but direct integration would add complexity without proportional value.
 

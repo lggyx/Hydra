@@ -1,8 +1,11 @@
 # Hydra 架构设计文档
 
-**版本**: 0.1.0-draft  
-**日期**: 2026-05-30  
+**版本**: 0.2.0  
+**日期**: 2026-05-31  
 **状态**: 草案 —— 开放评审  
+
+> **阅读指南**：本文档描述 Hydra 的**目标架构**。标注为**「规划态」**的章节尚未实现，当前代码采用不同的路径。
+> 实际已实现的架构见 [当前实现契约](./current-implementation-contract.md)。
 
 ---
 
@@ -18,7 +21,7 @@
 
 ---
 
-## 2. 系统拓扑
+## 2. 系统拓扑 *(规划态)*
 
 ```
                           ┌──────────────────────┐
@@ -57,7 +60,7 @@
 
 ---
 
-## 3. 核心抽象
+## 3. 核心抽象 *(规划态)*
 
 ### 3.1 Agent trait（统一接口）
 
@@ -271,7 +274,7 @@ pub struct AgentMetrics {
 
 ---
 
-## 4. ResourceManager（路由器）
+## 4. ResourceManager（路由器） *(规划态)*
 
 ResourceManager 是**唯一**持有 Agent 可变引用的组件。其他所有模块都是只读观察。
 
@@ -316,7 +319,7 @@ impl ResourceManager {
 
 ---
 
-## 5. Agent 实现
+## 5. Agent 实现 *(规划态)*
 
 ### 5.1 ExecutionAgent（执行者）
 
@@ -337,7 +340,7 @@ pub struct ExecutionAgent {
 }
 ```
 
-**工具范围限制**（参考 atomcode 的 `ScopedReadFile` 模式）：  
+**工具范围限制**（参考 hydra 的 `ScopedReadFile` 模式）：  
 ExecutionAgent 只拥有与其分配文件相关的工具。如果分配的是 `Service.java`，`read_file` 会被包装以拒绝任何非 `Service.java` 的路径。
 
 ### 5.2 OrchestratorAgent（调度者）
@@ -464,7 +467,7 @@ ISO-Framework 保证：
 
 ---
 
-## 8. Crate 结构
+## 8. Crate 结构 *(规划态)*
 
 ```
 hydra/
@@ -667,7 +670,7 @@ ISO-Framework 类型（封装，不泄露到 core）:
 | Agent 无进展挂起 | 超过可配置超时后被 kill | Orchestrator 的空闲检测（规则下限） |
 | Worktree 损坏 | main 分支无数据丢失 | ISO-Framework：绝不删除未合并的分支 |
 | 孤立 worktree | 清理时 GC | ISO-Framework::gc() |
-| 网络失败（LLM） | 带退避重试，然后 kill | TurnRunner 重试逻辑（来自 atomcode） |
+| 网络失败（LLM） | 带退避重试，然后 kill | TurnRunner 重试逻辑（来自 hydra） |
 | Git merge conflict | Agent 被 kill，冲突保留 | ISO-Framework 冲突检测 |
 | ResourceManager panic | Agent 继续运行（它们持有自己的 event_rx） | Agent 在 spawn 后不依赖 ResourceManager |
 
@@ -686,7 +689,7 @@ ISO-Framework 类型（封装，不泄露到 core）:
 
 ---
 
-## 12. 实施顺序
+## 12. 实施顺序 *(规划态)*
 
 ```
 Phase 0（1 周）：基础

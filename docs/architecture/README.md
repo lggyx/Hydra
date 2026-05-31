@@ -68,6 +68,6 @@ See [overview.md § 8](./overview.md#8-crate-structure) for full crate layout an
 | Project | URL | Relevance |
 |---------|-----|-----------|
 | ISO-Framework | https://github.com/snehith01001110/ISO-Framework | **Fork target** — worktree safety |
-| atomcode | /mnt/c/Users/15853/Workspace/Hydra/atomcode | **Upstream dependency** — Provider, Tool, TurnRunner |
+| hydra | /mnt/c/Users/15853/Workspace/Hydra/hydra | **Upstream dependency** — Provider, Tool, TurnRunner |
 | AutoAgents | https://github.com/liquidos-ai/AutoAgents | Reference — typed pub/sub, agent trait |
 | forge | https://github.com/automagik-dev/forge | Reference — UX patterns (not forked) |

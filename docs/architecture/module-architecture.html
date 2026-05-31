@@ -224,7 +224,7 @@
   <div class="module">
     <div class="module-title">
       <span class="badge badge-external">EXTERNAL</span>
-      atomcode-core
+      hydra-core
     </div>
     <div class="sub-module">
       <div class="sub-title">提供的核心能力</div>
@@ -766,7 +766,7 @@ tokio::spawn(agent.run(resources))
   ▼
 <span class="text-gray">// 8. ExecutionAgent 内部循环：LLM + Tool</span>
 loop {
-    response = provider.chat(chat_request)      // ← atomcode LlmProvider
+    response = provider.chat(chat_request)      // ← hydra LlmProvider
     tool_calls = parse_tool_calls(response)
     for call in tool_calls {
         tool = tool_registry.get(call.name)     // ← hydra-core ToolRegistry
@@ -896,7 +896,7 @@ ResourceManager::send_command(1, AgentCommand::ReviewTarget { ... })</code></pre
     <tr>
       <td class="text-green">ExecutionAgent</td>
       <td>LlmProvider::chat()</td>
-      <td class="text-purple">atomcode / provider.rs</td>
+      <td class="text-purple">hydra / provider.rs</td>
       <td>ChatRequest { model, messages, tools }</td>
       <td class="text-green">Stream&lt;Chunk&gt;</td>
     </tr>
@@ -974,7 +974,7 @@ dashboard ───────────────────────�
 
 <span class="text-gray">// hydra-core 只依赖：
 //   - hydra-workspace（worktree 操作）
-//   - atomcode-core（LLM / Tool 基础 trait）
+//   - hydra-core（LLM / Tool 基础 trait）
 //   - 标准库 + tokio + serde</span>
 
 <span class="text-gray">// 禁止的依赖（违反架构）：</span>

@@ -1,0 +1,25 @@
+{
+  "name": "@atomgit.com/hydra",
+  "version": "0.0.0-dev",
+  "description": "Open-source terminal AI coding agent — connect any LLM, edit code, run commands, verify autonomously",
+  "keywords": ["ai", "coding", "cli", "agent", "terminal", "llm"],
+  "homepage": "https://atomgit.com/atomgit_atomcode/hydra",
+  "repository": {
+    "type": "git",
+    "url": "git+https://atomgit.com/atomgit_atomcode/hydra.git"
+  },
+  "license": "MIT",
+  "author": "AtomGit",
+  "bin": {
+    "hydra": "./bin/hydra.js"
+  },
+  "files": [
+    "bin/hydra.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

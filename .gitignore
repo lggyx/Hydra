@@ -1,2 +1,94 @@
+# Build
+target/
+runs/
+
+# npm package: build artifacts
+packages/npm/*.tgz
+
+.env/
+
+# Git worktrees (used by superpowers:using-git-worktrees)
+.worktrees/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python (dev scripts)
+__pycache__/
+*.pyc
+/venv/
+
+# Web (separate frontend, not part of core)
+/web/
+
+# Node
+node_modules/
+**/node_modules/
+package-lock.json
+!extensions/vscode/package-lock.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Temp / WIP files
+site/index-new.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Config with secrets
+config.toml
+
+# Personal project instructions (loaded by Hydra, never committed)
+.hydra.user.md
+
+# Logs
+/datalog/
+/site/datalog/
+/test-report.md
+
+# Local docs (not pushed to remote)
+/doc/
+backend.log
+.venv-swebench/
+
+# Hydra local data (graph cache, etc.)
+.hydra/
+
+# Claude Code's project instructions — kept locally for the IDE/agent that
+# maintains hydra source, but NOT pushed (it's personal guidance, may
+# diverge between contributors, and shouldn't imply official project rules).
+/CLAUDE.md
+.claude/settings.local.json
+
+# Local eval harness — kept off version control. Includes scripts,
+# baseline/config TOML (may hold API keys), case inputs, run outputs,
+# and sample projects. The whole directory lives on disk for reruns
+# but never ships.
+scripts/eval/
+dist/
+docs/superpowers
+.mcp.json
+
+# Superpowers plugin state
+.superpowers/
+.plan_docs
+extensions/vscode/resources/bin/
+.kiro
+
+# Hydra local-scope configs (machine-specific)
+.hydra/local/
+scripts/build-official.sh
+build-official.sh
+build-official-vscode.sh
+
+# git worktrees
+.worktrees/
+
+
 .atomcode/
-atomcode/
