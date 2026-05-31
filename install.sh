@@ -89,11 +89,40 @@ fi
 
 if ! $INSTALLED; then
     echo "Building from source..."
+
+    # Install Rust if not present
     if ! command -v cargo &>/dev/null; then
-        echo "Error: Rust (cargo) is required. Install from https://rustup.rs/"
-        echo "Pre-built releases: https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
-        exit 1
+        echo "Rust not found. Installing Rust toolchain..."
+        if command -v curl &>/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        elif command -v wget &>/dev/null; then
+            wget -qO- https://sh.rustup.rs | sh -s -- -y
+        else
+            echo "Error: curl or wget required to install Rust"
+            exit 1
+        fi
+        # Source cargo env
+        if [ -f "$HOME/.cargo/env" ]; then
+            . "$HOME/.cargo/env"
+        fi
+        echo "Rust installed: $(rustc --version)"
     fi
+
+    if ! command -v git &>/dev/null; then
+        echo "Installing git..."
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq && apt-get install -y -qq git
+        elif command -v yum &>/dev/null; then
+            yum install -y -q git
+        elif command -v apk &>/dev/null; then
+            apk add --no-cache git
+        elif command -v brew &>/dev/null; then
+            brew install git
+        else
+            echo "Warning: git not found, please install git manually"
+        fi
+    fi
+
     if [ -f "Cargo.toml" ] && grep -q "hydra" Cargo.toml 2>/dev/null; then
         cargo build --release -p hydra-daemon -p hydra
     else
