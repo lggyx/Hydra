@@ -454,6 +454,8 @@ impl AgentRegistry {
                     store.clone(),
                     event_store.clone(),
                     event_broadcasts.clone(),
+                    active_tokens.clone(),
+                    mcp_cache.clone(),
                     agent_id.clone(),
                     working_dir,
                     input_text,
@@ -683,10 +685,12 @@ async fn run_orchestrator_execution(
     store: Arc<RwLock<AgentStore>>,
     event_store: Arc<RwLock<AgentEventStore>>,
     event_broadcasts: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
+    active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     agent_id: String,
     working_dir: String,
     input_text: Option<String>,
-    cancel_token: CancellationToken,
+    _cancel_token: CancellationToken,
 ) -> Result<(), ()> {
     use hydra_core::agent::orchestrator::OrchestratorAgent;
     use hydra_core::agent::traits::{Agent, AgentId};
@@ -697,11 +701,27 @@ async fn run_orchestrator_execution(
     let provider_config = config.providers.get(&provider_name).ok_or(())?.clone();
     let provider = provider::create_provider(&provider_config).map_err(|_| ())?;
 
-    let system_prompt = crate::build_api_system_prompt(
-        &PathBuf::from(&working_dir),
-        &config,
-        &provider_config,
-        &std::sync::Arc::new(std::sync::RwLock::new(hydra_core::skill::SkillRegistry::new())),
+    let system_prompt = format!(
+        "You are an orchestrator agent coordinating a team of execution agents.\n\
+         \n\
+         Working directory: {}\n\
+         \n\
+         ## Your tools\n\
+         - spawn_execution(task, branch?): Create and start a worker agent to execute a task.\n\
+           Use this to delegate coding work. Returns the new agent's ID.\n\
+         - inspect_agent(agent_id): Check the status of a child agent.\n\
+         - kill_agent(agent_id): Cancel a running child agent.\n\
+         \n\
+         ## Workflow\n\
+         1. Analyze the user's request. If it involves writing code, spawn one or more\n\
+            execution agents with specific, well-scoped tasks.\n\
+         2. Monitor your child agents using inspect_agent.\n\
+         3. When child agents complete, evaluate their results. Spawn more if needed.\n\
+         4. When the full task is complete, summarize what was done.\n\
+         5. If you need clarification from the user, ask. Otherwise proceed without asking.\n\
+         \n\
+         Be autonomous. Prefer spawning agents over asking questions.",
+        working_dir
     );
 
     let control_arc: std::sync::Arc<dyn hydra_core::agent::orchestrator::AgentControl> =
@@ -711,6 +731,8 @@ async fn run_orchestrator_execution(
             event_broadcasts: event_broadcasts.clone(),
             default_working_dir: working_dir.clone(),
             self_agent_id: agent_id.clone(),
+            active_tokens: active_tokens.clone(),
+            mcp_cache: mcp_cache.clone(),
         });
 
     let mut orch = OrchestratorAgent::new(
@@ -762,6 +784,8 @@ struct AgentControlBridge {
     store: Arc<RwLock<AgentStore>>,
     event_store: Arc<RwLock<AgentEventStore>>,
     event_broadcasts: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
+    active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     default_working_dir: String,
     self_agent_id: String,
 }
@@ -797,8 +821,41 @@ impl hydra_core::agent::orchestrator::AgentControl for AgentControlBridge {
     }
 
     fn start_agent(&self, id: &str, _message: &str) {
+        // Spawn actual execution for the child agent
+        let child_id = id.to_string();
+        let store = self.store.clone();
+        let event_store = self.event_store.clone();
+        let event_broadcasts = self.event_broadcasts.clone();
+        let active_tokens = self.active_tokens.clone();
+        let mcp_cache = self.mcp_cache.clone();
+        let working_dir = self.default_working_dir.clone();
+        // Update status first
         tokio::task::block_in_place(|| {
             self.store.blocking_write().update_status(id, AgentStatus::Queued);
+        });
+        // Spawn the execution in a background thread (not tokio, since we're in block_in_place)
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let cancel_token = CancellationToken::new();
+                active_tokens.write().await.insert(child_id.clone(), cancel_token.clone());
+                let result = run_real_execution(
+                    store.clone(),
+                    event_store.clone(),
+                    event_broadcasts.clone(),
+                    child_id.clone(),
+                    working_dir,
+                    None,
+                    cancel_token,
+                    mcp_cache,
+                ).await;
+                if let Err(_) = result {
+                    run_mock_progression(store, event_store, event_broadcasts, child_id.clone()).await;
+                }
+                active_tokens.write().await.remove(&child_id);
+            });
         });
     }
 
