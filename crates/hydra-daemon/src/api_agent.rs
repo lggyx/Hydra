@@ -745,6 +745,43 @@ async fn run_orchestrator_execution(
         control_arc,
     );
 
+    // Set up event forwarding: orchestrator TurnEvents → daemon event system
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<hydra_core::agent::commands::AgentEvent>();
+    orch.set_event_tx(evt_tx);
+    let fwd_broadcasts = event_broadcasts.clone();
+    let fwd_agent_id = agent_id.clone();
+    let fwd_event_store = event_store.clone();
+    tokio::spawn(async move {
+        while let Some(evt) = evt_rx.recv().await {
+            // Map orchestrated AgentEvent to daemon AgentEvent
+            let daemon_evt = match &evt {
+                hydra_core::agent::commands::AgentEvent::Turn { data, .. } => AgentEvent {
+                    seq: 0, agent_id: fwd_agent_id.clone(),
+                    event_type: "agent_message".to_string(),
+                    timestamp: now_ts(),
+                    payload: data.get("delta").cloned(),
+                },
+                hydra_core::agent::commands::AgentEvent::ToolCall { tool, success, .. } => AgentEvent {
+                    seq: 0, agent_id: fwd_agent_id.clone(),
+                    event_type: if *success { "tool_call_result" } else { "tool_call_start" }.to_string(),
+                    timestamp: now_ts(),
+                    payload: Some(serde_json::json!({"tool": tool, "success": success})),
+                },
+                _ => continue,
+            };
+            // Store + broadcast
+            let mut es = fwd_event_store.blocking_write();
+            let seq = es.events.get(&fwd_agent_id).map(|v| v.len() as u64 + 1).unwrap_or(1);
+            let mut daemon_evt = daemon_evt;
+            daemon_evt.seq = seq;
+            es.append(&fwd_agent_id, daemon_evt.clone());
+            drop(es);
+            if let Some(tx) = fwd_broadcasts.blocking_read().get(&fwd_agent_id) {
+                let _ = tx.send(daemon_evt);
+            }
+        }
+    });
+
     set_status(&store, &agent_id, AgentStatus::Running).await;
 
     let resources = hydra_core::agent::traits::ResourceHandle {
@@ -764,10 +801,18 @@ async fn run_orchestrator_execution(
     let outcome = orch.run(resources).await;
 
     match outcome {
-        Ok(o) => {
+        Ok(hydra_core::agent::traits::AgentOutcome::Success { summary }) => {
             set_status(&store, &agent_id, AgentStatus::Completed).await;
             append_event(&event_store, &event_broadcasts, &agent_id, "status_changed",
-                Some(serde_json::json!({"status": "completed", "summary": format!("{:?}", o)}))).await;
+                Some(serde_json::json!({"status": "completed", "summary": summary}))).await;
+        }
+        Ok(hydra_core::agent::traits::AgentOutcome::Failed { error }) => {
+            set_status(&store, &agent_id, AgentStatus::Failed).await;
+            append_event(&event_store, &event_broadcasts, &agent_id, "status_changed",
+                Some(serde_json::json!({"status": "failed", "error": error}))).await;
+        }
+        Ok(_) => {
+            set_status(&store, &agent_id, AgentStatus::Completed).await;
         }
         Err(e) => {
             set_status(&store, &agent_id, AgentStatus::Failed).await;
@@ -891,7 +936,22 @@ impl hydra_core::agent::orchestrator::AgentControl for AgentControlBridge {
                 "failed" => AgentStatus::Failed,
                 _ => return,
             };
-            self.store.blocking_write().update_status(&self.self_agent_id, s);
+            self.store.blocking_write().update_status(&self.self_agent_id, s.clone());
+            // Also emit event to broadcasts for TUI visibility
+            let mut es = self.event_store.blocking_write();
+            let seq = es.events.get(&self.self_agent_id).map(|v| v.len() as u64 + 1).unwrap_or(1);
+            let event = AgentEvent {
+                seq,
+                agent_id: self.self_agent_id.clone(),
+                event_type: "status_changed".to_string(),
+                timestamp: now_ts(),
+                payload: Some(serde_json::json!({"status": status})),
+            };
+            es.append(&self.self_agent_id, event.clone());
+            drop(es);
+            if let Some(tx) = self.event_broadcasts.blocking_read().get(&self.self_agent_id) {
+                let _ = tx.send(event);
+            }
         });
     }
 }

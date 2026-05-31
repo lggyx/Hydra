@@ -42,6 +42,10 @@ pub struct OrchestratorAgent {
 }
 
 impl OrchestratorAgent {
+    pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>) {
+        self.event_tx = Some(tx);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: AgentId,
@@ -152,11 +156,15 @@ impl Agent for OrchestratorAgent {
                 conversation.add_user_message(&input);
             }
 
-            while let Ok(_) = turn_rx.try_recv() {}
+            while let Ok(evt) = turn_rx.try_recv() {
+                forward_turn_event(&self.event_tx, self.id, &evt);
+            }
             let result = turn_runner
                 .run(&mut conversation, &self.system_prompt, &turn_tx, self.cancel_token.clone())
                 .await;
-            while let Ok(_) = turn_rx.try_recv() {}
+            while let Ok(evt) = turn_rx.try_recv() {
+                forward_turn_event(&self.event_tx, self.id, &evt);
+            }
 
             match result {
                 crate::turn::event::TurnResult::Responded { text, .. } => {
@@ -286,6 +294,38 @@ impl Tool for InspectAgentTool {
         match self.control.agent_status(&a.agent_id) {
             Some(status) => Ok(ToolResult { call_id: String::new(), output: format!("Agent {}: {}", a.agent_id, status), success: true }),
             None => Ok(ToolResult { call_id: String::new(), output: format!("Agent {} not found", a.agent_id), success: false }),
+        }
+    }
+}
+
+fn forward_turn_event(
+    tx: &Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    agent_id: AgentId,
+    evt: &TurnEvent,
+) {
+    if let Some(ref tx) = tx {
+        match evt {
+            TurnEvent::TextDelta(text) => {
+                let _ = tx.send(AgentEvent::Turn {
+                    agent_id,
+                    data: serde_json::json!({"delta": text}),
+                });
+            }
+            TurnEvent::ToolCallStarted { name, .. } | TurnEvent::ToolCallStreaming { name, .. } => {
+                let _ = tx.send(AgentEvent::ToolCall {
+                    agent_id,
+                    tool: name.clone(),
+                    success: true,
+                });
+            }
+            TurnEvent::ToolCallResult { name, success, .. } => {
+                let _ = tx.send(AgentEvent::ToolCall {
+                    agent_id,
+                    tool: name.clone(),
+                    success: *success,
+                });
+            }
+            _ => {}
         }
     }
 }
