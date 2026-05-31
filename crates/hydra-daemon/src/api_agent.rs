@@ -438,8 +438,8 @@ impl AgentRegistry {
                     (resolved.unwrap_or(d), wt)
                 }
                 None => {
-                    set_status(&store, &agent_id, AgentStatus::Failed);
-                    append_event(&event_store, &event_broadcasts, &agent_id, "status_changed", Some(serde_json::json!({"status": "failed", "error": "agent not found"})));
+                    set_status(&store, &agent_id, AgentStatus::Failed).await;
+                    append_event(&event_store, &event_broadcasts, &agent_id, "status_changed", Some(serde_json::json!({"status": "failed", "error": "agent not found"}))).await;
                     return;
                 }
             };
@@ -477,34 +477,34 @@ async fn run_mock_progression(
         let mut s = store.write().await;
         s.update_status(&agent_id, AgentStatus::Running);
     }
-    append_event(&event_store, &event_broadcasts, &agent_id, "status_changed", Some(serde_json::json!({"status": "running"})));
+    append_event(&event_store, &event_broadcasts, &agent_id, "status_changed", Some(serde_json::json!({"status": "running"}))).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     {
         let mut s = store.write().await;
         s.update_status(&agent_id, AgentStatus::Completed);
     }
-    append_event(&event_store, &event_broadcasts, &agent_id, "status_changed", Some(serde_json::json!({"status": "completed"})));
+    append_event(&event_store, &event_broadcasts, &agent_id, "status_changed", Some(serde_json::json!({"status": "completed"}))).await;
 }
 
 // Helper to set agent status
-fn set_status(
+async fn set_status(
     store: &Arc<RwLock<AgentStore>>,
     agent_id: &str,
     status: AgentStatus,
 ) {
-    let mut s = store.blocking_write();
+    let mut s = store.write().await;
     s.update_status(agent_id, status);
 }
 
 // Helper to append an event
-fn append_event(
+async fn append_event(
     event_store: &Arc<RwLock<AgentEventStore>>,
     event_broadcasts: &Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
     agent_id: &str,
     event_type: &str,
     payload: Option<serde_json::Value>,
 ) {
-    let mut es = event_store.blocking_write();
+    let mut es = event_store.write().await;
     let seq = es
         .events
         .get(agent_id)
@@ -518,7 +518,8 @@ fn append_event(
         payload,
     };
     es.append(agent_id, event.clone());
-    let bcasts = event_broadcasts.blocking_read();
+    drop(es);
+    let bcasts = event_broadcasts.read().await;
     if let Some(tx) = bcasts.get(agent_id) {
         let _ = tx.send(event);
     }
@@ -777,14 +778,14 @@ async fn run_real_execution(
     let (turn_tx, mut turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
 
     // 12. Mark agent as running
-    set_status(&store, &agent_id, AgentStatus::Running);
+    set_status(&store, &agent_id, AgentStatus::Running).await;
     append_event(
         &event_store,
         &event_broadcasts,
         &agent_id,
         "status_changed",
         Some(serde_json::json!({"status": "running"})),
-    );
+    ).await;
 
     // 13. Run turn loop
     let mut total_tool_calls: usize = 0;
@@ -792,20 +793,20 @@ async fn run_real_execution(
     let final_summary = loop {
         // Check if cancelled before each turn
         if cancel_token.is_cancelled() {
-            set_status(&store, &agent_id, AgentStatus::Cancelled);
+            set_status(&store, &agent_id, AgentStatus::Cancelled).await;
             append_event(
                 &event_store,
                 &event_broadcasts,
                 &agent_id,
                 "status_changed",
                 Some(serde_json::json!({"status": "cancelled"})),
-            );
+            ).await;
             return Ok(());
         }
 
         // Drain any pending turn events from previous iteration
         while let Ok(evt) = turn_rx.try_recv() {
-            map_turn_event(&event_store, &event_broadcasts, &agent_id, &evt, &mut total_tool_calls);
+            map_turn_event(&event_store, &event_broadcasts, &agent_id, &evt, &mut total_tool_calls).await;
         }
 
         let result = turn_runner
@@ -814,32 +815,32 @@ async fn run_real_execution(
 
         // Drain events from this turn
         while let Ok(evt) = turn_rx.try_recv() {
-            map_turn_event(&event_store, &event_broadcasts, &agent_id, &evt, &mut total_tool_calls);
+            map_turn_event(&event_store, &event_broadcasts, &agent_id, &evt, &mut total_tool_calls).await;
         }
 
         match result {
             TurnResult::Responded { text, .. } => break text,
             TurnResult::UsedTools { .. } => continue,
             TurnResult::Failed(e) => {
-                set_status(&store, &agent_id, AgentStatus::Failed);
+                set_status(&store, &agent_id, AgentStatus::Failed).await;
                 append_event(
                     &event_store,
                     &event_broadcasts,
                     &agent_id,
                     "status_changed",
                     Some(serde_json::json!({"status": "failed", "error": e})),
-                );
+                ).await;
                 return Ok(());
             }
             TurnResult::Cancelled => {
-                set_status(&store, &agent_id, AgentStatus::Cancelled);
+                set_status(&store, &agent_id, AgentStatus::Cancelled).await;
                 append_event(
                     &event_store,
                     &event_broadcasts,
                     &agent_id,
                     "status_changed",
                     Some(serde_json::json!({"status": "cancelled"})),
-                );
+                ).await;
                 return Ok(());
             }
         }
@@ -852,7 +853,7 @@ async fn run_real_execution(
     let _ = session_manager.save(&session);
 
     // 15. Mark completed
-    set_status(&store, &agent_id, AgentStatus::Completed);
+    set_status(&store, &agent_id, AgentStatus::Completed).await;
     append_event(
         &event_store,
         &event_broadcasts,
@@ -863,13 +864,13 @@ async fn run_real_execution(
             "summary": final_summary,
             "tool_calls": total_tool_calls,
         })),
-    );
+    ).await;
 
     Ok(())
 }
 
 /// Map a TurnEvent from TurnRunner into an AgentEvent in the event store.
-fn map_turn_event(
+async fn map_turn_event(
     event_store: &Arc<RwLock<AgentEventStore>>,
     event_broadcasts: &Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
     agent_id: &str,
@@ -884,7 +885,7 @@ fn map_turn_event(
                 agent_id,
                 "agent_message",
                 Some(serde_json::json!({"delta": text})),
-            );
+            ).await;
         }
         TurnEvent::ReasoningDelta(text) => {
             append_event(
@@ -893,7 +894,7 @@ fn map_turn_event(
                 agent_id,
                 "agent_reasoning",
                 Some(serde_json::json!({"delta": text})),
-            );
+            ).await;
         }
         TurnEvent::ToolCallStreaming { name, .. } => {
             append_event(
@@ -902,7 +903,7 @@ fn map_turn_event(
                 agent_id,
                 "tool_call_start",
                 Some(serde_json::json!({"tool": name})),
-            );
+            ).await;
         }
         TurnEvent::ToolCallStarted { name, .. } => {
             append_event(
@@ -911,7 +912,7 @@ fn map_turn_event(
                 agent_id,
                 "tool_call_start",
                 Some(serde_json::json!({"tool": name})),
-            );
+            ).await;
         }
         TurnEvent::ToolCallResult { name, success, .. } => {
             *tool_calls += 1;
@@ -921,7 +922,7 @@ fn map_turn_event(
                 agent_id,
                 "tool_call_result",
                 Some(serde_json::json!({"tool": name, "success": success})),
-            );
+            ).await;
         }
         TurnEvent::ToolBatchStarted { calls, .. } => {
             let names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
@@ -931,7 +932,7 @@ fn map_turn_event(
                 agent_id,
                 "tool_batch_start",
                 Some(serde_json::json!({"tools": names})),
-            );
+            ).await;
         }
         TurnEvent::ToolBatchCompleted { ok, total, .. } => {
             append_event(
@@ -940,7 +941,7 @@ fn map_turn_event(
                 agent_id,
                 "tool_batch_complete",
                 Some(serde_json::json!({"ok": ok, "total": total})),
-            );
+            ).await;
         }
         TurnEvent::Error(e) => {
             append_event(
@@ -949,7 +950,7 @@ fn map_turn_event(
                 agent_id,
                 "error",
                 Some(serde_json::json!({"error": e})),
-            );
+            ).await;
         }
         TurnEvent::TokenUsage {
             prompt_tokens,
@@ -967,7 +968,7 @@ fn map_turn_event(
                     "completion_tokens": completion_tokens,
                     "total_tokens": total_tokens,
                 })),
-            );
+            ).await;
         }
         _ => {}
     }
