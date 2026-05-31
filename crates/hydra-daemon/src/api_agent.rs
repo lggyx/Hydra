@@ -784,35 +784,38 @@ impl hydra_core::agent::orchestrator::AgentControl for AgentControlBridge {
             parent_agent_id: Some(id.clone()),
             pending_input: Some(task.to_string()),
         };
-        let mut s = self.event_store.blocking_write();
-        // Actually we need to insert into AgentStore. Let's use blocking write.
-        drop(s);
-        let mut s = self.store.blocking_write();
-        s.insert(agent);
+        tokio::task::block_in_place(|| {
+            self.store.blocking_write().insert(agent);
+        });
         id
     }
 
-    fn start_agent(&self, id: &str, message: &str) {
-        // We can't call spawn_agent_execution here because we don't have the full AgentRegistry.
-        // Instead, update the store directly to simulate the start command flow.
-        let mut s = self.store.blocking_write();
-        s.update_status(id, AgentStatus::Queued);
-        // The actual execution would need to be triggered externally.
+    fn start_agent(&self, id: &str, _message: &str) {
+        tokio::task::block_in_place(|| {
+            self.store.blocking_write().update_status(id, AgentStatus::Queued);
+        });
     }
 
     fn cancel_agent(&self, id: &str) {
-        let mut s = self.store.blocking_write();
-        s.update_status(id, AgentStatus::Cancelled);
+        tokio::task::block_in_place(|| {
+            self.store.blocking_write().update_status(id, AgentStatus::Cancelled);
+        });
     }
 
     fn agent_status(&self, id: &str) -> Option<String> {
-        let s = self.store.blocking_read();
-        s.get(id).map(|a| format!("{:?}", a.status).to_lowercase())
+        tokio::task::block_in_place(|| {
+            self.store.blocking_read().get(id)
+                .map(|a| format!("{:?}", a.status).to_lowercase())
+        })
     }
 
     fn list_agents(&self) -> Vec<(String, String)> {
-        let s = self.store.blocking_read();
-        s.list().into_iter().map(|a| (a.id, format!("{:?}", a.status).to_lowercase())).collect()
+        tokio::task::block_in_place(|| {
+            self.store.blocking_read().list()
+                .into_iter()
+                .map(|a| (a.id, format!("{:?}", a.status).to_lowercase()))
+                .collect()
+        })
     }
 }
 
