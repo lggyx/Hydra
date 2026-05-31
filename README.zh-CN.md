@@ -1,94 +1,143 @@
 <div align="center">
-<pre>
+
+<img src="https://img.shields.io/badge/Hydra-4.23.3-6366f1?style=for-the-badge&logo=rust&logoColor=white" alt="version">
+<img src="https://img.shields.io/badge/Rust-1.88%2B-orange?style=for-the-badge&logo=rust&logoColor=white" alt="rust">
+<img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge&logo=mit&logoColor=white" alt="license">
+<img src="https://img.shields.io/badge/Domain-CANN%20Ascend-8b5cf6?style=for-the-badge" alt="domain">
+
+<br><br>
+
+<pre style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            font-weight: bold; line-height: 1.2; display: inline-block;">
 ██   ██ ██    ██ ██████  ██████   █████  
 ██   ██  ██  ██  ██   ██ ██   ██ ██   ██ 
 ███████   ████   ██   ██ ██████  ███████ 
 ██   ██    ██    ██   ██ ██   ██ ██   ██ 
 ██   ██    ██    ██████  ██   ██ ██   ██ 
 </pre>
+
+<h3 style="margin-top: 8px;">面向昇腾 CANN 算子开发测试的 AI 原生多智能体系统</h3>
+
+<a href="./README.md">English</a> · 
+<a href="#为什么选择-hydra">为什么</a> ·
+<a href="#跑分对比">跑分</a> ·
+<a href="#安装">安装</a> ·
+<a href="#快速开始">快速开始</a> ·
+<a href="#算子开发工作流">工作流</a> ·
+<a href="#架构">架构</a> ·
+<a href="https://gitcode.com/cann/cannbot-skills" target="_blank">审查层</a>
+
 </div>
 
-<p align="center">
-  <strong>面向昇腾 CANN 算子开发测试的 AI 原生多智能体系统</strong>
-</p>
+---
 
-<p align="center">
-  <a href="./README.md">English</a> · 简体中文
-</p>
+<table>
+<tr>
+<td width="50%">
 
-<p align="center">
-  <a href="#快速开始">快速开始</a> ·
-  <a href="#架构">架构</a> ·
-  <a href="#算子开发工作流">算子工作流</a> ·
-  <a href="https://gitcode.com/cann/cannbot-skills" target="_blank">审查层</a> ·
-  <a href="#开发">开发</a>
-</p>
+### 为什么选择 Hydra
 
-<p align="center">
-  <img src="https://img.shields.io/badge/version-4.23.3-blue" alt="version">
-  <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
-</p>
+CANN 算子开发意味着每个算子都要写 `op_api`、`op_host`、`op_kernel` 三层代码——然后编译、测试、性能调优、精度验证。**重复、模式化、耗时。**
+
+Hydra 用一支 **AI 智能体团队** 替代手动迭代：
+
+- **OrchestratorAgent** 分解任务，协调调度
+- **ExecutionAgent** 并行实现算子
+- **cannbot-skills** 提供自动审查门禁
+
+</td>
+<td width="50%">
+
+### 一行安装
+
+**Linux / macOS：**
+```bash
+curl -fsSL https://raw.githubusercontent.com/lggyx/Hydra/main/install.sh | bash
+```
+
+**Windows：**
+```powershell
+iwr -useb https://raw.githubusercontent.com/lggyx/Hydra/main/install.ps1 | iex
+```
+
+自动检测环境、安装依赖、编译部署。无需手动配置。
+
+</td>
+</tr>
+</table>
 
 ---
 
-> **Hydra 是面向昇腾 CANN 算子开发测试的 AI 原生多智能体系统。** 通过 LLM 驱动的多智能体协作（Orchestrator + 并行 ExecutionAgents + Reviewer），自动完成算子分析、实现、测试和优化。
-
----
-
-## 为什么用 Hydra 开发 CANN 算子
-
-CANN 算子开发涉及大量重复的模式化工作——`op_api`、`op_host`、`op_kernel` 三层代码结构，加上严格的性能调优和精度验证要求。Hydra 专门为此打造：
-
-- **并行算子开发** — OrchestratorAgent 分解任务后，多个 ExecutionAgent 并行开发不同算子
-- **自动代码审查** — 接入 [cannbot-skills](https://gitcode.com/cann/cannbot-skills) 作为审查层和质量门禁，每个算子的实现都要通过自动审查才能合入
-- **性能感知优化** — Agent 通过跑分对比检测性能回归，自动建议向量化、分块等优化策略
-- **精度验证** — 与参考实现自动对比，支持容差感知的差异报告
-- **全流程自动化** — 从读取 ops-math 规格到输出通过测试覆盖的代码，全程自主完成
-
+<a name="跑分对比"></a>
 ## 多智能体 vs 单智能体：CANN 算子跑分对比
 
-我们在相同任务上对比了 Hydra 多智能体架构与单智能体基线（OpenCode，使用相同 LLM ）：为 ops-math 实现 Mul、Add、Pow 算子并编写端到端测试。
+> 相同任务（ops-math Mul、Add、Pow 算子实现）、相同 LLM，不同架构。
 
-### 质量报告：Hydra 多智能体
+<table>
+<tr>
+<td width="50%" style="vertical-align: top;">
 
-| 板块 | 内容 |
-|------|------|
-| 总览 | 30 用例 / **96.7%** 通过率 / 行覆盖 87.1% / 分支覆盖 77.1% |
-| 精度明细 | 按 dtype（float16/float32/bfloat16）、序列长度、API 变体三维度拆分 |
-| 性能指标 | 平均执行 48.3μs、吞吐量 1.82 GElem/s、内存占用 312KB |
-| 覆盖率明细 | op_api 92.3%, op_host 88.7%, op_kernel 81.4%, kernel_launch 79.2%, test_utils 94.1% |
-| 质量评分 | 7 维度加权总分 **4.7/5.0**，与 Ascend 官方基准偏差 ≤ 3.2% |
-| 问题与建议 | 3 个 P1 建议（向量化路径、内存对齐、边界测试），0 个 P0 |
-| 结论 | 总体评级 4.7/5.0 ⭐⭐⭐⭐ |
+<div style="border: 2px solid #6366f1; border-radius: 12px; padding: 16px; background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);">
 
-### 质量报告：OpenCode 单智能体
+<h4 align="center" style="color: #6366f1; margin: 0 0 12px 0;">Hydra 多智能体</h4>
 
 | 板块 | 内容 |
 |------|------|
-| 总览 | 30 用例 / **73.3%** 通过率 / 行覆盖 58.4% / 分支覆盖 42.6% |
-| 精度明细 | float32 精度正常，float16 出现 3 处 NaN，bfloat16 未覆盖 |
-| 性能指标 | 平均执行 112.7μs（**慢 2.3 倍**）、吞吐量 0.74 GElem/s、内存占用 528KB |
-| 覆盖率明细 | op_api 71.2%, op_host 54.8%, op_kernel 38.1%, kernel_launch 31.6%, test_utils 66.3% |
-| 质量评分 | 7 维度加权总分 **2.3/5.0**，与 Ascend 官方基准偏差 18.7% |
-| 问题与建议 | 5 个 P0（内存泄漏、边界越界、类型转换错误）+ 8 个 P1/P2 |
-| 结论 | 总体评级 2.3/5.0 ⭐⭐ |
+| 总览 | 30 用例 / **96.7%** 通过率 |
+| 行覆盖 | **87.1%** / 分支覆盖 **77.1%** |
+| 性能 | 48.3μs / 1.82 GElem/s / 312KB |
+| 覆盖率 | op_api 92.3%, op_host 88.7%, op_kernel 81.4% |
+| 质量评分 | **4.7 / 5.0** ⭐⭐⭐⭐ |
+| P0 问题 | **0** |
+| 开发时长 | **~3 分钟**（并行） |
+
+</div>
+
+</td>
+<td width="50%" style="vertical-align: top;">
+
+<div style="border: 2px solid #d1d5db; border-radius: 12px; padding: 16px; background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%);">
+
+<h4 align="center" style="color: #6b7280; margin: 0 0 12px 0;">OpenCode 单智能体</h4>
+
+| 板块 | 内容 |
+|------|------|
+| 总览 | 30 用例 / **73.3%** 通过率 |
+| 行覆盖 | **58.4%** / 分支覆盖 **42.6%** |
+| 性能 | 112.7μs / 0.74 GElem/s / 528KB |
+| 覆盖率 | op_api 71.2%, op_host 54.8%, op_kernel 38.1% |
+| 质量评分 | **2.3 / 5.0** ⭐⭐ |
+| P0 问题 | **5**（内存泄漏/边界越界/类型错误） |
+| 开发时长 | **~8 分钟**（串行） |
+
+</div>
+
+</td>
+</tr>
+</table>
 
 ### 关键差异
 
 | 指标 | Hydra 多智能体 | OpenCode 单智能体 | 提升 |
-|------|---------------|-------------------|------|
-| 测试通过率 | **96.7%** | 73.3% | +23.4pp |
-| 行覆盖率 | **87.1%** | 58.4% | +28.7pp |
+|------|:--:|:--:|:--:|
+| 测试通过率 | **96.7%** | 73.3% | **+23.4pp** |
+| 行覆盖率 | **87.1%** | 58.4% | **+28.7pp** |
 | 平均执行时间 | **48.3μs** | 112.7μs | **快 2.3 倍** |
 | 质量评分 | **4.7** | 2.3 | **高 2.0 倍** |
 | P0 问题 | **0** | 5 | — |
-| 开发时长 | **~3 分钟**（并行） | ~8 分钟（串行） | **快 2.7 倍** |
+| 开发时长 | **~3 分钟** | ~8 分钟 | **快 2.7 倍** |
 
-> **多智能体胜出的原因**：Hydra 的 Orchestrator 将任务拆分为并行 ExecutionAgent 单元，每个专注于一个算子。这消除了上下文切换开销，实现了并行开发+测试。cannbot-skills 审查门禁能捕获单 Agent 在长会话中因上下文疲劳而遗漏的错误。
+> **多智能体胜出的原因**：Orchestrator 将任务拆分为并行的单算子单元。每个 ExecutionAgent 专注于一个算子——无上下文切换，无长会话疲劳。cannbot-skills 审查门禁能捕获单 Agent 遗漏的错误。
 
+---
+
+<a name="安装"></a>
 ## 安装
+
+<table>
+<tr>
+<td width="50%">
 
 ### 一行安装
 
@@ -102,6 +151,9 @@ curl -fsSL https://raw.githubusercontent.com/lggyx/Hydra/main/install.sh | bash
 iwr -useb https://raw.githubusercontent.com/lggyx/Hydra/main/install.ps1 | iex
 ```
 
+</td>
+<td width="50%">
+
 ### 从源码构建
 
 ```bash
@@ -110,70 +162,80 @@ git clone https://github.com/lggyx/Hydra.git
 cd Hydra
 cargo build --release
 
-# 或用安装脚本的 --build-from-source 选项
+# 或用安装脚本
 bash install.sh --build-from-source
-# .\install.ps1 -BuildFromSource    (Windows)
 ```
 
+</td>
+</tr>
+</table>
+
+---
+
+<a name="快速开始"></a>
 ## 快速开始
 
 ```bash
-# 启动守护进程
+# 终端1：启动守护进程
 hydra-daemon
 
-# 另一个终端启动 TUI
+# 终端2：启动 TUI
 hydra
-
-# 在 TUI 中：
-/login                             # 领取免费 API 配额
-/agents create --kind orchestrator # 创建编排者
-/agents <id> start "实现 Mul 算子的 op_api 和 op_host 层，并编写端到端测试"
-# 编排者会自动派生工作智能体，通过 cannbot-skills 审查，最后汇报结果
 ```
 
+**在 TUI 中：**
+
+| 步骤 | 命令 | 说明 |
+|------|------|------|
+| 登录 | `/login` | 领取免费 API 配额 |
+| 创建编排者 | `/agents create --kind orchestrator` | 启动管理智能体 |
+| 部署任务 | `/agents <id> start "实现 Mul 算子并编写完整测试"` | 编排者派发工作 |
+| 监控 | `/agents` | 列出所有智能体及状态 |
+| 查看 | `/agents <id> events` | 查看详细事件历史 |
+
+---
+
+<a name="算子开发工作流"></a>
 ## 算子开发工作流
 
 ```
 用户任务："实现 Mul、Add、Pow 算子的端到端测试"
        │
        ▼
-  OrchestratorAgent（编排者）
+  OrchestratorAgent  ── 任务分解
        │
-       ├── spawn_execution("实现 Mul 算子 op_api + op_host + op_kernel")
-       │   └── ExecutionAgent #1 → 写代码 → 编译 → 测试 → 报告
-       │
-       ├── spawn_execution("实现 Add 算子 op_api + op_host + op_kernel")
-       │   └── ExecutionAgent #2 → 写代码 → 编译 → 测试 → 报告
-       │
-       ├── spawn_execution("实现 Pow 算子 op_api + op_host + op_kernel")
-       │   └── ExecutionAgent #3 → 写代码 → 编译 → 测试 → 报告
-       │
-       └── cannbot-skills 审查层 ←──┐
-              │                      │
-              ├── 代码审查（lint, 漏洞）│
-              ├── 性能基准对比 ←───────┤ 所有算子输出
-              ├── 精度验证 ←───────────┤ 全部通过审查
-              └── 合入门禁 ────────────┘
+       ├── spawn_execution("Mul: op_api + op_host + op_kernel")  →  ExecutionAgent #1
+       ├── spawn_execution("Add: op_api + op_host + op_kernel")  →  ExecutionAgent #2
+       └── spawn_execution("Pow: op_api + op_host + op_kernel")  →  ExecutionAgent #3
+                                          │
+                                          ▼
+                                   cannbot-skills 审查层
+                                   ├── Lint & 类型安全
+                                   ├── 正确性 vs 参考实现
+                                   ├── 性能基准对比
+                                   ├── 精度验证
+                                   └── 合入门禁
 ```
 
-详细工作流文档：[docs/cann-operator-workflow.zh.md](docs/cann-operator-workflow.zh.md)
+详细工作流：[docs/cann-operator-workflow.zh.md](docs/cann-operator-workflow.zh.md)
 
+---
+
+<a name="架构"></a>
 ## 架构
-
-Hydra 基于统一的 `Agent` trait 实现多智能体系统：
 
 ```
 hydra/
   crates/
     hydra-core/     # Agent trait 系统 + TurnRunner + 工具集
       agent/
-        traits.rs          # Agent trait, AgentKind (Execution/Orchestrator/Reviewer)
-        execution.rs       # ExecutionAgent — 拥有完整工具访问权的工作智能体
-        orchestrator.rs    # OrchestratorAgent — spawn/kill/monitor 子智能体
-        resource_manager.rs  # Agent 注册 + 事件扇出
+        traits.rs          # Agent trait, AgentId/Kind/State/Outcome
+        execution.rs       # ExecutionAgent — 单算子开发
+        orchestrator.rs    # OrchestratorAgent — 任务协调
+        resource_manager.rs  # 注册 + 事件扇出
 
     hydra-daemon/   # HTTP/SSE API 服务
-      api_agent.rs    # Agent CRUD, SSE 事件流, orch 执行桥接
+      api_agent.rs    # Agent CRUD, SSE 事件流, 编排桥接
 
     hydra-tuix/     # 终端 UI（保留模式渲染器）
     hydra-cli/      # 二进制入口
@@ -181,36 +243,38 @@ hydra/
 
 ### Agent 类型
 
-| Agent | 角色 | CANN 算子开发中的典型用途 |
-|-------|------|--------------------------|
-| **OrchestratorAgent** | 任务分解、子智能体协调 | 把"实现所有 ops-math 算子"拆成每个算子的子任务 |
-| **ExecutionAgent** | 代码实现、编译、测试 | 为单个算子编写 op_api/op_host/op_kernel |
-| **ReviewerAgent** *(规划中)* | 代码审查、跑分对比 | 验证与参考实现的一致性，检查性能回归 |
+| Agent | 角色 | CANN 算子开发用途 |
+|-------|------|------------------|
+| **OrchestratorAgent** | 任务分解、协调调度 | 将 ops-math 拆分为每个算子的子任务 |
+| **ExecutionAgent** | 代码实现、编译、测试 | 为单个算子编写 op_api/host/kernel |
+| **ReviewerAgent** *(规划中)* | 代码审查、跑分对比 | cannbot-skills: lint、正确性、性能、精度 |
 
 ### 设计原则
 
-1. **统一 Agent 接口** — 所有智能体实现相同的 `Agent` trait。新增智能体类型（如测试员、跑分员）无需修改编排者。
+| # | 原则 |
+|---|------|
+| P1 | **统一 Agent 接口** — 所有智能体共享 `Agent` trait |
+| P2 | **默认并行** — N 个算子 = N 个并行 ExecutionAgent |
+| P3 | **审查门禁** — 所有输出通过 cannbot-skills 审查 |
+| P4 | **性能感知** — Agent 理解 CANN profiling 并自动优化 |
+| P5 | **精度优先** — 与参考实现的容差感知对比 |
+| P6 | **领域感知** — 内置 op_api/host/kernel 三层知识 |
 
-2. **默认为并行** — OrchestratorAgent 同时派生多个 ExecutionAgent。N 个算子 = N 个并行工作智能体。
-
-3. **审查门禁集成** — 每个算子的实现合入前必须通过 [cannbot-skills](https://gitcode.com/cann/cannbot-skills) 审查。自动 lint、正确性校验、跑分检查。
-
-4. **性能感知** — Agent 能够理解 CANN profiling 输出，针对性能瓶颈（向量化、内存布局、分块）自动迭代优化。
-
-5. **精度优先** — 与参考实现自动对比，支持容差感知的差异报告，确保数值精度。
+---
 
 ## 配置
 
 ```bash
-# 设置 LLM provider
 /provider add anthropic --api-key $ANTHROPIC_API_KEY
 /provider default anthropic
 
-# 或使用内置免费配额
+# 或使用免费配额
 /login
 ```
 
-支持 OpenAI 兼容 API、Anthropic、DeepSeek、MiniMax、GLM、Qwen、Ollama 等。
+支持 Anthropic、OpenAI、DeepSeek、MiniMax、GLM、Qwen、Ollama 及任何 OpenAI 兼容 API。
+
+---
 
 ## 项目指令文件
 
@@ -221,33 +285,45 @@ hydra/
 
 - 目标平台：Ascend 910B, CANN 8.0.RC1
 - 算子类别：Math（Mul, Add, Pow）、Activation（ReLU, GELU）
-- 代码结构：op_api/op_host/op_kernel 三层模式
+- 代码结构：op_api / op_host / op_kernel 三层模式
 - 测试框架：ops-math 测试套件 + gcov 覆盖率
-- 性能目标：与手写基线偏差在 5% 以内
-- 尽量使用向量化（Vector API）
+- 性能目标：与手写基线偏差 ≤ 5%
+- 尽量使用 Vector API
 ```
 
-Hydra 会自动读取并将其注入到每个 Agent 的系统提示词中。
+---
+
+<table>
+<tr>
+<td width="50%">
 
 ## 开发
 
 ```bash
-# 构建
 cargo build -p hydra-daemon -p hydra-cli
-
-# 运行测试
 cargo test -p hydra-daemon
 cargo test -p hydra-core --test contract_connectivity
 ```
 
-完整开发指南：[docs/development-workflow.md](docs/development-workflow.md)
+[开发指南](docs/development-workflow.md)
+
+</td>
+<td width="50%">
 
 ## 社区
 
-- [报告问题](https://github.com/lggyx/Hydra/issues)
-- [CANN 算子审查层](https://gitcode.com/cann/cannbot-skills)
-- [架构深入阅读](docs/architecture/README.zh.md)
+- [问题反馈](https://github.com/lggyx/Hydra/issues)
+- [审查层](https://gitcode.com/cann/cannbot-skills)
+- [架构文档](docs/architecture/README.zh.md)
 
-## 许可证
+</td>
+</tr>
+</table>
 
-MIT — 详见 [LICENSE](LICENSE)
+---
+
+<div align="center">
+
+**MIT License** · [查看许可证](LICENSE)
+
+</div>
