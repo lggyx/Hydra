@@ -32,12 +32,11 @@
 
 ## 已发现差异
 
-### A. 架构文档中的 `/api/v1/agents|worktrees|branches` 尚未在代码中实现
-- 文档中将其描述为更高层的 StateServer 风格接口
-- 当前代码中的 `hydra-daemon` 暴露的是 `/sessions`、`/chat`、`/project`、`/providers`、`/auth/*` 等接口
-- 处理建议：
-  - 若未来确实要做多 Agent / worktree 编排层，则新增该接口面并补契约测试
-  - 若短期内不做，则应在架构文档中明确其为“目标态/规划态”而非“当前已实现态”
+### A. ❌ 已解决：`/api/v1/agents|worktrees|branches` 端点已实现
+- `crates/hydra-daemon/src/api_agent.rs` — GET/POST `/api/v1/agents`, GET `/:id`, POST `/:id/commands`, GET `/:id/events`, GET `/:id/events/stream`（SSE）
+- `crates/hydra-daemon/src/api_worktree.rs` — GET/POST `/api/v1/worktrees`, DELETE `/:id`
+- `crates/hydra-daemon/src/api_branch.rs` — GET/POST `/api/v1/branches`, DELETE `/:name`
+- 已补 Router 级 smoke 测试（`main.rs` — `agent_smoke_create_list_start_events`）
 
 ### B. daemon 与 CLI 的权限语义不同
 - CLI：危险操作走交互审批
@@ -52,10 +51,18 @@
 - 当前已修复：`hydra-daemon` 统一改为使用与 `hydra-core::SessionManager` 对齐的 hash 逻辑
 - 处理建议：后续所有涉及 project hash 的新接口，都应复用同一套 helper/契约测试
 
-### D. daemon 的动态路由需要继续做一次全量核对
-- 当前主路由中已经发现存在旧式参数写法与新式写法并存的风险
-- 本轮测试没有依赖完整 blackbox 路由匹配，而是先钉住 handler 与持久化语义
-- 处理建议：后续做一轮 daemon 路由巡检，把动态参数风格统一，并补 1 组真正走 Router 的黑盒接口 smoke
+### D. ❌ 已解决：路由巡检完成，已补 Router 级 smoke 测试
+- 路由参数风格已统一为 axum `:param` 语法
+- 已补 `agent_smoke_create_list_start_events` 黑盒测试：完整走 Router 验证 agent 创建→列表→详情→start→事件查询的端到端链路
+
+### E. `overview.md` 描述的 Agent trait / ResourceManager 架构与实现不一致
+- 文档第 2-5、8、12 节描述的目标架构（Agent trait、ResourceManager、OrchestratorAgent、hydra-workspace crate）与当前 `AgentLoop` 通道驱动架构不同
+- 处理：`overview.md` 相关章节已标注为「规划态」，新增 `current-implementation-contract.md` 描述当前真实实现
+- 长期目标：按 Agent trait 架构重构（见方案 B 规划）
+
+### F. 设计规范文档 `docs/superpowers/specs/` 缺失
+- `team-assignment.zh.md` 和 `module-contract-cards.zh.md` 引用的设计规范不存在
+- 处理建议：可后续补写，或删除引用
 
 ## 当前建议的执行策略
 
