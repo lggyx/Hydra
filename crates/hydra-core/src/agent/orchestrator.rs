@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,6 +40,7 @@ pub struct OrchestratorAgent {
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
     pending_input: Option<String>,
     notify: Arc<Notify>,
+    should_complete: Arc<AtomicBool>,
 }
 
 impl OrchestratorAgent {
@@ -80,6 +82,7 @@ impl OrchestratorAgent {
             event_tx: None,
             pending_input: None,
             notify: Arc::new(Notify::new()),
+            should_complete: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -111,9 +114,12 @@ impl Agent for OrchestratorAgent {
         let kill_tool = KillAgentTool { control: self.control.clone() };
         let inspect_tool = InspectAgentTool { control: self.control.clone() };
 
+        let complete_tool = DeclareCompleteTool { done: self.should_complete.clone() };
+
         tool_registry.register_sync(Box::new(spawn_tool));
         tool_registry.register_sync(Box::new(kill_tool));
         tool_registry.register_sync(Box::new(inspect_tool));
+        tool_registry.register_sync(Box::new(complete_tool));
 
         let shared_tools = std::sync::Arc::new(tool_registry);
 
@@ -150,6 +156,9 @@ impl Agent for OrchestratorAgent {
         loop {
             if self.cancel_token.is_cancelled() {
                 return Ok(AgentOutcome::Failed { error: "cancelled".to_string() });
+            }
+            if self.should_complete.load(Ordering::Relaxed) {
+                return Ok(AgentOutcome::Success { summary: last_response });
             }
 
             if let Some(input) = self.pending_input.take() {
@@ -353,6 +362,31 @@ fn forward_turn_event(
             }
             _ => {}
         }
+    }
+}
+
+struct DeclareCompleteTool { done: Arc<AtomicBool> }
+#[async_trait]
+impl Tool for DeclareCompleteTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "declare_complete",
+            description: "Declare that the overall task is complete. Use this when all child agents have finished and you have a final summary to report.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "Summary of what was accomplished"}
+                },
+                "required": ["summary"]
+            }),
+        }
+    }
+    fn approval(&self, _args: &str) -> ApprovalRequirement { ApprovalRequirement::AutoApprove }
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> anyhow::Result<ToolResult> {
+        #[derive(Deserialize)] struct Args { summary: String }
+        let a: Args = serde_json::from_str(args).map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.done.store(true, Ordering::Relaxed);
+        Ok(ToolResult { call_id: String::new(), output: format!("Task complete: {}", a.summary), success: true })
     }
 }
 

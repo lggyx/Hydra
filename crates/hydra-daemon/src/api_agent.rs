@@ -711,6 +711,8 @@ async fn run_orchestrator_execution(
            Use this to delegate coding work. Returns the new agent's ID.\n\
          - inspect_agent(agent_id): Check the status of a child agent.\n\
          - kill_agent(agent_id): Cancel a running child agent.\n\
+         - declare_complete(summary): Call this when all work is done to report the final result.\n\
+           Do NOT call inspect_agent in a loop. Check once, then move on.\n\
          \n\
          ## Workflow\n\
          1. Analyze the user's request. If it involves writing code, spawn one or more\n\
