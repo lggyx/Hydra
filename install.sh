@@ -73,33 +73,46 @@ else
     fi
 
     FILES=(
-        "hydra-daemon:${BASE_URL}/hydra-daemon-${OS_NAME}-${ARCH_NAME}"
-        "hydra:${BASE_URL}/hydra-${OS_NAME}-${ARCH_NAME}"
+        "hydra-daemon|${BASE_URL}/hydra-daemon-${OS_NAME}-${ARCH_NAME}"
+        "hydra|${BASE_URL}/hydra-${OS_NAME}-${ARCH_NAME}"
     )
 
+    DOWNLOAD_OK=true
     for FILE_SPEC in "${FILES[@]}"; do
-        NAME="${FILE_SPEC%%:*}"
-        URL="${FILE_SPEC##*:}"
+        NAME="${FILE_SPEC%%|*}"
+        URL="${FILE_SPEC##*|}"
         DEST="$BIN_DIR/$NAME"
         echo "Downloading $NAME..."
         if command -v curl &>/dev/null; then
-            curl -fsSL "$URL" -o "$DEST" || {
-                echo "Download failed: $URL"
-                echo "Try building from source: bash install.sh --build-from-source"
-                exit 1
-            }
+            curl -fsSL "$URL" -o "$DEST" || DOWNLOAD_OK=false
         elif command -v wget &>/dev/null; then
-            wget -q "$URL" -O "$DEST" || {
-                echo "Download failed: $URL"
-                echo "Try building from source: bash install.sh --build-from-source"
-                exit 1
-            }
+            wget -q "$URL" -O "$DEST" || DOWNLOAD_OK=false
         else
             echo "Error: curl or wget required"
             exit 1
         fi
+        if ! $DOWNLOAD_OK; then
+            echo "Download failed: $URL"
+            echo "No pre-built release found for $VERSION. Building from source..."
+            BUILD_FROM_SOURCE=true
+            break
+        fi
         chmod +x "$DEST"
     done
+
+    if $BUILD_FROM_SOURCE; then
+        if ! command -v cargo &>/dev/null; then
+            echo "Error: Rust (cargo) is required. Install from https://rustup.rs/"
+            echo "Or wait for pre-built releases at https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
+            exit 1
+        fi
+        echo "Building from source..."
+        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+        cd "$SCRIPT_DIR"
+        cargo build --release -p hydra-daemon -p hydra
+        cp target/release/hydra-daemon "$BIN_DIR/"
+        cp target/release/hydra "$BIN_DIR/"
+    fi
 fi
 
 # Add to PATH
