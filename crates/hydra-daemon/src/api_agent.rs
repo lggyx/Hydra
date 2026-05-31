@@ -420,14 +420,6 @@ impl AgentRegistry {
         active_tokens.write().await.insert(agent_id.clone(), cancel_token.clone());
 
         tokio::spawn(async move {
-            // Cleanup token when done. Clone agent_id for the guard so the
-            // original can be moved into run_mock_progression on fallback.
-            let agent_id_for_cleanup = agent_id.clone();
-            let _token_guard = scopeguard::guard((), move |_| {
-                let mut tokens = active_tokens.blocking_write();
-                tokens.remove(&agent_id_for_cleanup);
-            });
-
             let (working_dir, _worktree_id) = match {
                 let s = store.read().await;
                 s.get(&agent_id).map(|a| (a.working_dir.clone(), a.worktree_id.clone()))
@@ -440,6 +432,7 @@ impl AgentRegistry {
                 None => {
                     set_status(&store, &agent_id, AgentStatus::Failed).await;
                     append_event(&event_store, &event_broadcasts, &agent_id, "status_changed", Some(serde_json::json!({"status": "failed", "error": "agent not found"}))).await;
+                    active_tokens.write().await.remove(&agent_id);
                     return;
                 }
             };
@@ -458,8 +451,10 @@ impl AgentRegistry {
 
             if let Err(_e) = result {
                 // Fall back to mock progression so tests and simple cases still work
-                run_mock_progression(store, event_store, event_broadcasts, agent_id).await;
+                run_mock_progression(store, event_store, event_broadcasts, agent_id.clone()).await;
             }
+
+            active_tokens.write().await.remove(&agent_id);
         });
     }
 
