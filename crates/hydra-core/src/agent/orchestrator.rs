@@ -21,7 +21,8 @@ pub trait AgentControl: Send + Sync {
     fn start_agent(&self, id: &str, message: &str);
     fn cancel_agent(&self, id: &str);
     fn agent_status(&self, id: &str) -> Option<String>;
-    fn list_agents(&self) -> Vec<(String, String)>; // (id, status)
+    fn list_agents(&self) -> Vec<(String, String)>;
+    fn set_self_status(&self, status: &str);
 }
 
 pub struct OrchestratorAgent {
@@ -92,6 +93,7 @@ impl Agent for OrchestratorAgent {
             s.status = AgentStatus::Running { turn: 0, max_turns: 100 };
             s.updated_at = now_ts();
         }
+        self.control.set_self_status("running");
 
         let working_dir_path = self.working_dir.clone();
         let tool_context = crate::tool::ToolContext::new(working_dir_path.clone());
@@ -160,6 +162,7 @@ impl Agent for OrchestratorAgent {
                         s.status = AgentStatus::WaitingInput;
                         s.updated_at = now_ts();
                     }
+                    self.control.set_self_status("waiting_input");
                     tokio::select! {
                         _ = self.notify.notified() => continue,
                         _ = self.cancel_token.cancelled() => {

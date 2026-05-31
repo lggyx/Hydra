@@ -541,6 +541,10 @@ impl hydra_core::agent::orchestrator::AgentControl for AgentRegistry {
             .map(|a| (a.id, format!("{:?}", a.status).to_lowercase()))
             .collect()
     }
+
+    fn set_self_status(&self, _status: &str) {
+        // Orchestrator running within AgentRegistry would update via post_command path
+    }
 }
 
 /// Shared mock progression logic used as fallback.
@@ -706,6 +710,7 @@ async fn run_orchestrator_execution(
             event_store: event_store.clone(),
             event_broadcasts: event_broadcasts.clone(),
             default_working_dir: working_dir.clone(),
+            self_agent_id: agent_id.clone(),
         });
 
     let mut orch = OrchestratorAgent::new(
@@ -758,6 +763,7 @@ struct AgentControlBridge {
     event_store: Arc<RwLock<AgentEventStore>>,
     event_broadcasts: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
     default_working_dir: String,
+    self_agent_id: String,
 }
 
 impl hydra_core::agent::orchestrator::AgentControl for AgentControlBridge {
@@ -816,6 +822,19 @@ impl hydra_core::agent::orchestrator::AgentControl for AgentControlBridge {
                 .map(|a| (a.id, format!("{:?}", a.status).to_lowercase()))
                 .collect()
         })
+    }
+
+    fn set_self_status(&self, status: &str) {
+        tokio::task::block_in_place(|| {
+            let s = match status {
+                "running" => AgentStatus::Running,
+                "waiting_input" => AgentStatus::WaitingInput,
+                "completed" => AgentStatus::Completed,
+                "failed" => AgentStatus::Failed,
+                _ => return,
+            };
+            self.store.blocking_write().update_status(&self.self_agent_id, s);
+        });
     }
 }
 
