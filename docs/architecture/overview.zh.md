@@ -18,6 +18,9 @@
 | P3 | **默认工作区隔离** | 每个 ExecutionAgent 运行在独立的 git worktree 中。两个 Agent 绝不共享工作目录。 |
 | P4 | **能用 LLM 决策的地方就用 LLM** | Orchestrator 用强模型做调度决策，而非硬编码规则。规则仅作为安全下限。 |
 | P5 | **内部可替换** | QualityGate、Provider、ToolRegistry 都是 trait 化的。替换实现无需改动编排逻辑。 |
+| P6 | **CANN 算子领域感知** | Agent 理解 op_api/op_host/op_kernel 三层模式和 CANN 构建系统及 Ascend profiling 工具链。 |
+| P7 | **审查门禁集成** | 所有 Agent 产出的代码在合入前都要通过 [cannbot-skills](https://gitcode.com/cann/cannbot-skills) 审查层。自动化 lint、正确性、性能、精度检查。 |
+| P8 | **默认并行执行** | N 个算子 = N 个并行 ExecutionAgent。Orchestrator 自动分解任务并扇出到独立工作智能体。 |
 
 ---
 

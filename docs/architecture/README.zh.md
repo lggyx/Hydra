@@ -1,14 +1,16 @@
 # Hydra 架构文档
 
-本文档包含 Hydra 的完整架构设计 —— 一个基于 Rust 的多 Agent 代码生成系统，采用 LLM 驱动编排 + git worktree 隔离。
+本文档包含 Hydra 的完整架构设计 —— 一个面向昇腾 CANN 算子开发测试的 Rust 多智能体系统，采用 LLM 驱动编排 + 集成审查门禁。
 
 ## 文档列表
 
 | 文件 | 内容 |
 |------|------|
-| [overview.zh.md](./overview.zh.md) | 完整架构设计：设计原则、核心抽象、事件流、crate 结构、接口契约、失败模式 |
-| [fork-analysis.zh.md](./fork-analysis.zh.md) | GitHub 项目分析（ISO-Framework、forge、AutoAgents）及 fork 集成方案 |
-| [diagrams.zh.md](./diagrams.zh.md) | Mermaid 架构图：系统拓扑、Agent 生命周期、事件流、部署、依赖、工作区布局 |
+| [overview.zh.md](./overview.zh.md) | 完整架构设计：设计原则（含 CANN 领域）、核心抽象、事件流、crate 结构 |
+| [current-implementation-contract.md](./current-implementation-contract.md) | 当前已实现架构 vs 目标架构对比 |
+| [diagrams.zh.md](./diagrams.zh.md) | Mermaid 架构图：系统拓扑、Agent 生命周期、CANN 算子开发工作流 |
+| [fork-analysis.zh.md](./fork-analysis.zh.md) | 开源项目分析及 fork 集成方案 |
+| [../cann-operator-workflow.zh.md](../cann-operator-workflow.zh.md) | CANN 算子开发测试端到端工作流 + cannbot-skills 审查层 |
 | [README.zh.md](./README.zh.md) | 本文件 —— 架构文档入口 |
 
 ## 快速导航

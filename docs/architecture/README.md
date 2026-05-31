@@ -1,14 +1,16 @@
 # Hydra Architecture Documentation
 
-This directory contains the complete architecture design for Hydra — a Rust-based multi-agent code generation system with LLM-driven orchestration and git worktree isolation.
+This directory contains the complete architecture design for Hydra — a Rust-based multi-agent system for Ascend CANN operator development and testing, with LLM-driven orchestration and integrated review gates.
 
 ## Documents
 
 | File | Purpose |
 |------|---------|
-| [overview.md](./overview.md) | Complete architecture design: principles, core abstractions, event flow, crate structure, interface contracts, failure modes |
-| [fork-analysis.md](./fork-analysis.md) | Analysis of GitHub projects (ISO-Framework, forge, AutoAgents) and fork integration plan |
-| [diagrams.md](./diagrams.md) | Mermaid diagrams: system topology, agent lifecycle, event flow, deployment, dependencies, workspace layout |
+| [overview.md](./overview.md) | Complete architecture design: principles (incl. CANN domain), core abstractions, event flow, crate structure |
+| [current-implementation-contract.md](./current-implementation-contract.md) | Currently implemented vs. planned architecture |
+| [diagrams.md](./diagrams.md) | Mermaid diagrams: system topology, agent lifecycle, CANN operator workflow |
+| [fork-analysis.md](./fork-analysis.md) | Analysis of GitHub projects and fork integration plan |
+| [../cann-operator-workflow.md](../cann-operator-workflow.md) | CANN operator dev/test end-to-end workflow with cannbot-skills review |
 | [README.md](./README.md) | This file — entry point to architecture docs |
 
 ## Quick Navigation

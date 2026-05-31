@@ -38,9 +38,9 @@ TUI (hydra-cli)                     Daemon (hydra-daemon)
 
 | 概念 | 目标架构 (overview.md) | 当前实现 |
 |------|------------------------|----------|
-| Agent 接口 | `Agent` trait (run / on_command) | `AgentSnapshot` + `AgentRegistry` (状态机驱动) |
-| Agent 调度 | `ResourceManager` (spawn / send_command / subscribe) | `spawn_agent_execution` 直调 `run_real_execution` |
-| Agent 类型 | ExecutionAgent / OrchestratorAgent / ReviewerAgent | 无类型区分，统一执行路径 |
+| Agent 接口 | `Agent` trait (run / on_command) | `AgentSnapshot` + `AgentRegistry` (状态机驱动)，Agent trait 已实现 |
+| Agent 调度 | `ResourceManager` (spawn / send_command / subscribe) | `spawn_agent_execution` → `run_real_execution` / `run_orchestrator_execution` |
+| Agent 类型 | ExecutionAgent / OrchestratorAgent / ReviewerAgent | ExecutionAgent + OrchestratorAgent 已实现，ReviewerAgent 规划中（接入 cannbot-skills） |
 | 事件分发 | `ResourceManager` 单点 fan-out | `AgentEventStore` + `broadcast::Sender` per agent |
 | Worktree 隔离 | 每个 Agent 运行在独立 git worktree | `AgentSnapshot.worktree_id` 可选关联，执行时解析路径 |
 

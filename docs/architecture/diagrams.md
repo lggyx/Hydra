@@ -424,3 +424,67 @@ flowchart TB
 - **VS Code**: Install "Mermaid Preview" extension, open this file
 - **CLI**: `npm install -g @mermaid-js/mermaid-cli` then `mmdc -i diagrams.md -o architecture.svg`
 - **GitHub**: Native support in markdown files
+
+---
+
+## 9. CANN Operator Development & Testing Workflow
+
+```mermaid
+flowchart TB
+    U[User Task: Implement Mul, Add, Pow operators]
+    U --> O[OrchestratorAgent]
+    O --> |spawn_execution| E1[ExecutionAgent #1: Mul]
+    O --> |spawn_execution| E2[ExecutionAgent #2: Add]
+    O --> |spawn_execution| E3[ExecutionAgent #3: Pow]
+
+    E1 --> |op_api + op_host + op_kernel| B1[Build with CANN toolchain]
+    E2 --> |op_api + op_host + op_kernel| B2[Build with CANN toolchain]
+    E3 --> |op_api + op_host + op_kernel| B3[Build with CANN toolchain]
+
+    B1 --> T1[Run ops-math tests]
+    B2 --> T2[Run ops-math tests]
+    B3 --> T3[Run ops-math tests]
+
+    T1 --> R[cannbot-skills Review Layer]
+    T2 --> R
+    T3 --> R
+
+    R --> |Lint + Correctness + Perf + Accuracy| G{Merge Gate}
+    G --> |Pass| F[declare_complete]
+    G --> |Fail| FB[Feedback back to ExecutionAgent]
+    FB --> E1
+    FB --> E2
+    FB --> E3
+```
+
+## 10. CANN Operator Parallel Development Timeline
+
+```mermaid
+gantt
+    title CANN Operator Development (Parallel)
+    dateFormat X
+    axisFormat %s
+
+    section Orchestrator
+    Task decomposition    :a1, 0, 2
+    Review coordination   :a2, 3, 6
+    Final report          :a3, 7, 8
+
+    section Mul Operator
+    op_api implementation :b1, 2, 4
+    op_host implementation: b2, 4, 6
+    op_kernel + perf tuning: b3, 6, 7
+
+    section Add Operator
+    op_api implementation :c1, 2, 4
+    op_host implementation: c2, 4, 6
+    op_kernel + perf tuning: c3, 6, 7
+
+    section Pow Operator
+    op_api implementation :d1, 2, 4
+    op_host implementation: d2, 4, 6
+    op_kernel + perf tuning: d3, 6, 7
+
+    section Review
+    cannbot-skills review :e1, 3, 8
+```

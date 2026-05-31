@@ -64,6 +64,11 @@
 - `team-assignment.zh.md` 和 `module-contract-cards.zh.md` 引用的设计规范不存在
 - 处理建议：可后续补写，或删除引用
 
+### G. ReviewerAgent 审查层待实现
+- `AgentKind::Reviewer` 已定义，但 `ReviewerAgent` 未实现
+- 需接入 https://gitcode.com/cann/cannbot-skills 作为外部审查门禁
+- 处理建议：实现 `ReviewerAgent` 实现 `Agent` trait，集成 cannbot-skills 的 lint/正确性/性能/精度检查
+
 ## 当前建议的执行策略
 
 ### P0：按当前真实实现分工开发

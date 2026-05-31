@@ -9,7 +9,7 @@
 </div>
 
 <p align="center">
-  <strong>Open-source terminal AI coding agent written in Rust</strong>
+  <strong>AI-Native Multi-Agent System for Ascend CANN Operator Development & Testing</strong>
 </p>
 
 <p align="center">
@@ -17,530 +17,174 @@
 </p>
 
 <p align="center">
-  <a href="#installation">Install</a> ·
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#features">Features</a> ·
   <a href="#architecture">Architecture</a> ·
-  <a href="#development">Development</a> ·
-  <a href="#contributing">Contributing</a> ·
-  <a href="#community">Community</a>
+  <a href="#operator-workflow">Operator Workflow</a> ·
+  <a href="https://gitcode.com/cann/cannbot-skills" target="_blank">Review Layer</a> ·
+  <a href="#development">Development</a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.18.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-4.23.3-blue" alt="version">
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="rust">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20HarmonyOS PC%20%7C%20Windows-lightgrey" alt="platform">
-  <a href="https://atomgit.com/atomgit_atomcode/hydra" target="_blank">
-    <img src="https://atomgit.com/atomgit_atomcode/hydra/star/badge.svg" alt="Hydra Star"/>
-  </a>
 </p>
 
 ---
 
-> **This project is 100% AI-generated.** Every line of code, every architectural decision's implementation, and every commit was written by AI. The human developer serves solely as the decision-maker and product manager — defining what to build, not how to build it.
+> **Hydra is an AI-native multi-agent system purpose-built for Ascend CANN operator development and testing.** It uses a team of LLM-powered agents (Orchestrator + parallel ExecutionAgents + Reviewer) to analyze, implement, test, and optimize CANN operators — automatically.
 
 ---
 
-Hydra is an AI coding agent that lives in your terminal. Give it a task in natural language, and it will read your codebase, edit files, run commands, and verify its work — autonomously.
+## Why Hydra for CANN Operators
 
-Think of it as an open-source alternative to Claude Code / Cursor Agent, but running entirely in your terminal and connecting to any OpenAI-compatible API.
+CANN operator development involves repetitive, pattern-heavy work across `op_api`, `op_host`, and `op_kernel` layers — plus rigorous performance tuning and accuracy verification. Hydra accelerates this with:
 
-## Features
-
-### Agent Loop
-
-- **Autonomous multi-step execution** — reads files, edits code, runs tests, fixes errors, all in a loop
-- **Verification loop** — automatically verifies edits via syntax checks before declaring success
-- **Dynamic step budget** — scales with the number of edited files, capped per turn to bound cost
-- **Loop detection** — detects and breaks out of repetitive tool-call patterns
-- **3-layer JSON repair** — recovers malformed tool-call arguments
-- **Turn-level datalog** — structured per-turn logs for replay, debugging, and eval harnesses
-
-### Built-in Tools
-
-File & shell:
-
-- `read_file`, `write_file`, `edit_file`, `search_replace`
-- `bash`, `grep`, `glob`, `list_directory`, `change_dir`
-- `web_search`, `web_fetch`
-
-Code graph (language-aware code intelligence):
-
-- `list_symbols`, `read_symbol`, `find_references`
-- `trace_callers`, `trace_callees`, `trace_chain`
-- `file_deps`, `blast_radius`
-
-Automation:
-
-- `auto_fix` — automatic lint/typecheck fix loop
-- `use_skill` — invoke a user-defined skill
-
-### Multi-Provider Support
-
-Connect to any LLM that supports OpenAI's function-calling API:
-
-| Provider | Function Calling | Tested Models |
-|----------|:---:|---|
-| Claude (Anthropic) | Yes | Claude Sonnet 4.5/4.6, Opus 4.6 |
-| OpenAI | Yes | GPT-4o, GPT-4.1 |
-| DeepSeek | Yes | DeepSeek V3, DeepSeek R1 |
-| Zhipu (GLM) | Yes | GLM-4, GLM-5 |
-| Qwen (Alibaba) | Yes | Qwen-Plus, Qwen-Max |
-| SiliconFlow | Yes | Various open models |
-| Ollama (local) | Partial | Llama 3, Qwen2, etc. |
-| Any OpenAI-compatible API | Yes | — |
-
-### Sessions & Login
-
-- **Persistent sessions** — every conversation is saved; continue the last session with `hydra --continue` / `-c`, or resume/switch inside the TUI with `/resume`
-- **Hydra OAuth login** — `/login` (or `hydra login`) pairs your CLI with your AtomGit account
-- **SSO login** — `/login-with-sso` for GitCode internal users
-- **Headless mode** — `hydra -p "..."` runs a single prompt non-interactively and streams the reply on stdout (Claude Code `-p` style); approval-required `bash` calls are auto-approved, while other approval-required tools are denied
-- **Daemon mode** — `hydra-daemon` exposes an HTTP API for session history and SSE streaming chat
-
-### Terminal UI
-
-- **Real-time streaming** with markdown rendering and syntax highlighting
-- **Code blocks** with language labels, line numbers, and `base16-ocean.dark` theme
-- **Multi-line input** with Shift+Enter (or `\` + Enter), auto-growing height, input history
-- **Text selection** with mouse drag, auto-scroll, and clipboard copy
-- **Slash commands** — `/model`, `/provider`, `/resume`, `/bg`, `/diff`, `/undo`, `/cost`, `/clear`, `/compact`, etc. (see table below)
-- **File attachment** — paste file paths to attach content as context
-- **Bracketed paste** — long paste content collapsed to a compact indicator
-- **Skills** — user-defined commands loaded from your skill directory, invoked like any slash command
-
-### Safety
-
-- **Destructive command detection** — `rm -rf`, `git push --force`, `DROP TABLE`, etc. require explicit approval
-- **Path-aware confirmations** — external reads, sensitive paths, and all writes outside the workspace can require confirmation depending on risk level
-- **Sensitive file protection** — protected system paths, credential directories, shell configs, `.env` files, and key/cert files receive stronger confirmation rules
-- **Shell bypass protection** — common shell file commands like `cat`, `head`, `ls`, `cp`, `mv`, and `tee` inherit the same path approval model as file tools
-- **Per-session permission grants** — approve once per tool pattern, or always-allow
-- **Source file deletion requires approval** — `rm` on code files is never auto-approved
-- **Undo** — `/undo` rolls back the last turn's file edits via file-history snapshots
-
-See [Permission Model](./docs/security/permission-model.md) for the full design and current boundaries.
-
-### Privacy
-
-- 📊 Anonymous telemetry (opt-out) — see [docs/telemetry.md](docs/telemetry.md)
-
-## Installation
-
-### From Source (recommended)
-
-```bash
-git clone https://atomgit.com/atomgit_atomcode/hydra.git
-cd hydra
-cargo install --path crates/hydra-cli --locked
-```
-
-The binary will be generated at `target/release/hydra` and installed to
-`~/.cargo/bin/hydra` for macOS / Linux / HarmonyOS PC and `$env:USERPROFILE/.cargo/bin/hydra.exe`
-for Windows. Make sure that `~/.cargo/bin` (or `%USERPROFILE%\.cargo\bin` on Windows) is
-in your `PATH`.
-
-To compile without installing, run:
-
-```bash
-cargo build --release
-```
-
-and the binary will be generated at `target/release/hydra`.
-
-### Requirements
-
-- Rust 1.88+ (for building; older Cargo versions cannot parse the current lockfile)
-- An API key from any supported provider (or an AtomGit account for `/login`)
-
-### Uninstall
-
-Remove Hydra and (optionally) its data:
-
-```bash
-hydra uninstall                # interactive: per-group prompts
-hydra uninstall --keep-data    # only remove binary + PATH edit
-hydra uninstall --purge        # remove everything, including ~/.hydra
-hydra uninstall --dry-run      # show plan, change nothing
-```
-
-If the binary is already broken or missing:
-
-```bash
-curl -fsSL https://atomgit.com/atomgit_atomcode/hydra/raw/main/uninstall.sh | sh
-# Windows:
-irm https://atomgit.com/atomgit_atomcode/hydra/raw/main/uninstall.ps1 | iex
-```
-
-By default credentials (`auth.toml`, `mcp.json`, `config.toml`, `ATOMCODE.md`) are kept; pass `--purge` to remove them too.
+- **Parallel operator development** — OrchestratorAgent spawns multiple ExecutionAgents, each working on different operators simultaneously
+- **Automated review gate** — Integrated with [cannbot-skills](https://gitcode.com/cann/cannbot-skills) as a code review and quality gate layer. Every operator implementation passes through automated review before merge
+- **Performance-aware optimization** — Agents detect performance regressions via benchmark comparison, suggest vectorization and tiling strategies
+- **Accuracy verification** — Automated correctness checks against reference implementations with structured diff reporting
+- **End-to-end automation** — From reading the ops-math spec to producing passing test coverage, fully autonomous
 
 ## Quick Start
 
-### 1. First Run
-
 ```bash
-hydra
+# Install from source (Rust 1.88+)
+git clone https://github.com/lggyx/Hydra.git
+cd Hydra
+cargo build --release
+
+# Start the daemon
+cargo run -p hydra-daemon
+
+# In another terminal, start the TUI
+cargo run -p hydra
+
+# In the TUI:
+/login                             # Get free API quota
+/agents create --kind orchestrator # Create an orchestrator
+/agents <id> start "实现 Mul 算子的 op_api 和 op_host 层，并编写端到端测试"
+# The orchestrator will spawn worker agents, review with cannbot-skills, and report results
 ```
 
-On first run, a setup wizard will guide you through configuring your LLM provider:
+## Operator Development Workflow
 
 ```
-Welcome to Hydra! Let's set up your first provider.
-
-Select provider:
-  [1] Claude (Anthropic)
-  [2] OpenAI
-  [3] OpenAI Compatible (DeepSeek, Qwen, Zhipu, Moonshot...)
-  [4] Ollama (local)
+User task: "实现 Mul、Add、Pow 算子的端到端测试"
+       │
+       ▼
+  OrchestratorAgent
+       │
+       ├── spawn_execution("实现 Mul 算子 op_api + op_host + op_kernel")
+       │   └── ExecutionAgent #1 → write code → build → test → report
+       │
+       ├── spawn_execution("实现 Add 算子 op_api + op_host + op_kernel")  
+       │   └── ExecutionAgent #2 → write code → build → test → report
+       │
+       ├── spawn_execution("实现 Pow 算子 op_api + op_host + op_kernel")
+       │   └── ExecutionAgent #3 → write code → build → test → report
+       │
+       └── cannbot-skills Review Layer ←─┐
+              │                           │
+              ├── Code review (lint, vuln)│
+              ├── Performance benchmark───┤ All operator outputs
+              ├── Accuracy verification───┤ pass through review
+              └── Merge gate ─────────────┘
 ```
 
-### 2. Configuration
-
-Config is stored at `~/.hydra/config.toml`. A minimal single-provider
-setup looks like this:
-
-```toml
-default_provider = "deepseek"
-
-[providers.deepseek]
-type           = "openai"
-api_key        = "sk-..."
-model          = "deepseek-chat"
-base_url       = "https://api.deepseek.com/v1"
-context_window = 64000
-```
-
-You can declare multiple providers and switch between them with `/model`
-or `/provider`. A **complete reference** covering Claude / OpenAI /
-OpenAI-compatible endpoints (DeepSeek, GLM, SiliconFlow, OpenRouter...) /
-Ollama, plus the `[datalog]` section, lives at
-[`docs/config.example.toml`](docs/config.example.toml) — copy and edit the
-bits you need.
-
-After editing `config.toml` by hand, run `/reload` inside hydra to pick
-up the changes without restarting.
-
-### 3. Start Coding
-
-```bash
-# Open in your project directory
-cd your-project
-hydra
-
-# Or specify directory
-hydra -C /path/to/project
-
-# Or specify model
-hydra --model gpt-4o
-
-# Headless (single prompt, reply on stdout)
-hydra -p "Explain the agent loop in this repo"
-
-# Read prompt from file
-hydra --prompt-file task.md
-```
-
-In headless mode, approval-required `bash` calls are auto-approved and logged to stderr; other approval-required tools are denied.
-
-Then just type what you want:
-
-```
-> Fix the login bug where users get redirected to 404 after OAuth callback
-
-> Add a dark mode toggle to the settings page
-
-> Refactor the database module to use connection pooling
-
-> Write tests for the payment processing module
-```
-
-## Keybindings
-
-### Input
-
-| Key | Action |
-|-----|--------|
-| `Enter` | Send message |
-| `Shift+Enter` | New line (requires Kitty keyboard protocol) |
-| `Ctrl+Enter` | New line (requires Kitty keyboard protocol) |
-| `Ctrl+J` | New line (requires Kitty keyboard protocol) |
-| `Alt+Enter` | New line (most terminals; see compatibility note below) |
-| `\` + `Enter` | New line (works on all terminals — type a `\` and press Enter; the `\` is consumed) |
-| `Esc` | Clear input / Cancel stream |
-| `Up/Down` | Browse input history |
-| `Tab` | Accept suggestion |
-| `Ctrl+U` | Clear line |
-| `Ctrl+W` | Delete word |
-| `Ctrl+K` | Delete to end of line |
-| `Ctrl+V` | Paste image from clipboard (Windows: use `/paste`, see below) |
-
-> **Terminal compatibility for newline chords:**
-> - `Shift+Enter`, `Ctrl+Enter`, and `Ctrl+J` all need a terminal that speaks the Kitty keyboard protocol — kitty, WezTerm, Alacritty, iTerm2 ≥3.5, Windows Terminal ≥1.21. Older terminals collapse them to plain `Enter` (which sends the message).
-> - `Alt+Enter` works at the byte level on most terminals, but **Windows Terminal binds it to "toggle full screen" by default** — remove that binding under Settings → Actions to free it up.
-> - Xshell does not support the Kitty protocol; in its keymap settings, map a free chord to send `ESC, Enter` (`\x1b\r`) to get the same effect, or paste multi-line text via the clipboard (bracketed paste is enabled).
-
-> **Pasting images on Windows:**
-> Windows Terminal and conhost bind `Ctrl+V` to their own `paste` action, which only forwards `CF_UNICODETEXT` from the clipboard — an image-only clipboard sends nothing, so the in-app `Ctrl+V` handler never fires. Two ways out:
-> 1. Use **`/paste`** — the slash command pulls the clipboard image and attaches it as `[Image #N]`. Works in every terminal, including Windows Terminal, PowerShell 7, conhost, and git bash. The TUI's bottom-right hint on Windows says `Image in clipboard · /paste` automatically.
-> 2. If you want `Ctrl+V` muscle memory: open Windows Terminal `settings.json` (`Ctrl+,` → "Open JSON file") and either delete the `{ "command": "paste", "keys": "ctrl+v" }` entry under `"actions"`, or rebind it to `ctrl+shift+v`. After a restart, `Ctrl+V` passes through to hydra.
->
-> Git Bash (MinTTY) doesn't intercept `Ctrl+V`, so it works there out of the box.
-
-### Navigation
-
-| Key | Action |
-|-----|--------|
-| `Ctrl+Up/Down` | Scroll chat (3 lines) |
-| `PageUp/PageDown` | Scroll chat (page) |
-| `Ctrl+L` | Clear conversation |
-| `Ctrl+Shift+C` | Copy selection |
-| `Ctrl+C` | Cancel operation (double-tap to exit) |
-
-### Slash Commands
-
-| Command | Action |
-|---------|--------|
-| `/resume` | Resume or switch session |
-| `/session` | Create a new session |
-| `/bg` | Background current session; subcommands: `/bg list`, `/bg <N>`, `/bg drop <N>`, `/bg help` |
-| `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot |
-| `/provider` | Manage providers |
-| `/model` | Switch model / provider |
-| `/login` | Login with Hydra OAuth |
-| `/cd` | Change working directory |
-| `/paste` | Attach an image from the clipboard (Windows fallback for Ctrl+V) |
-| `/undo` | Undo last turn's edits |
-| `/diff` | Show git diff of current changes |
-| `/cost` | Show token usage for this session |
-| `/copy` | Copy last AI response |
-| `/clear` | Clear conversation |
-| `/issue` | Create issue on AtomGit |
-| `/config` | Edit config file |
-| `/status` | Show login status and model info |
-| `/logout` | Logout from AtomGit |
-| `/help` | Show commands & shortcuts |
-| `/quit` | Exit (or Ctrl+C ×2) |
+Detailed workflow: [docs/cann-operator-workflow.md](docs/cann-operator-workflow.md)
 
 ## Architecture
-
-Hydra is a Rust workspace with four crates:
-
-```
-hydra/
-  crates/
-    hydra-core/     # Headless library — no TUI dependency
-      agent/           # Agent trait, ExecutionAgent, OrchestratorAgent
-        traits.rs        # Agent trait, AgentId, AgentKind, AgentState
-        execution.rs     # ExecutionAgent — full TurnRunner-backed worker
-        orchestrator.rs  # OrchestratorAgent — spawn/kill/inspect child agents
-        resource_manager.rs  # Agent registry + event fan-out
-      turn/            # TurnRunner, datalog, permission decider
-      config/          # Config loading, provider configs
-      conversation/    # Message types, windowed context
-      provider/        # LlmProvider trait + OpenAI/Claude/Ollama
-      tool/            # Tool trait + built-in tool implementations
-      session/         # Persistent sessions
-      skill.rs         # User-defined skills
-
-    hydra-tuix/     # Terminal UI — retained-mode renderer (CC-style normal mode)
-      event_loop/      # App state machine, command dispatch
-      render/          # Cell-based renderer, diff, retained-mode frame loop
-      modals/          # Picker UIs (dir, model, session, provider, issue)
-
-    hydra-cli/      # Binary entry point (TUI + headless -p mode)
-      main.rs          # CLI args, first-run wizard, launch
-      auth/            # Hydra OAuth client
-
-    hydra-daemon/   # HTTP/SSE API server over hydra-core
-      api_agent.rs     # Agent API: create, start, cancel, events, SSE stream
-      api_worktree.rs  # Worktree management endpoints
-      api_branch.rs    # Branch management endpoints
-```
-
-### Agent Architecture
 
 Hydra implements a multi-agent system based on a unified `Agent` trait:
 
 ```
-OrchestratorAgent ("do the task")
-    │
-    ├── spawn_execution("write the API")
-    │   └── ExecutionAgent → TurnRunner → LLM + tools
-    ├── spawn_execution("build the UI")
-    │   └── ExecutionAgent → TurnRunner → LLM + tools
-    └── inspect_agent / kill_agent / declare_complete
+hydra/
+  crates/
+    hydra-core/     # Agent trait system + TurnRunner + tools
+      agent/
+        traits.rs          # Agent trait, AgentKind (Execution/Orchestrator/Reviewer)
+        execution.rs       # ExecutionAgent — worker with full tool access
+        orchestrator.rs    # OrchestratorAgent — spawn/kill/monitor child agents
+        resource_manager.rs  # Agent registry + event fan-out
+
+    hydra-daemon/   # HTTP/SSE API server
+      api_agent.rs    # Agent CRUD, SSE event stream, orch execution bridge
+
+    hydra-tuix/     # Terminal UI (retained-mode renderer)
+    hydra-cli/      # Binary entry point
 ```
 
-- **ExecutionAgent** — A worker agent that runs an LLM turn loop with full tool access (bash, edit, read, write, MCP, LSP). Used via `/agents create`.
-- **OrchestratorAgent** — A manager agent that spawns child execution agents, monitors their progress, and reports results. Used via `/agents create --kind orchestrator`. Supports multi-turn conversation with `waiting_input` state.
-- **ResourceManager** — Tracks agent states, fans out events to subscribers, provides `spawn`/`send_command`/`subscribe` interface.
+### Agent Types
+
+| Agent | Role | Canonical Use in CANN Pipeline |
+|-------|------|-------------------------------|
+| **OrchestratorAgent** | Task decomposition, child agent coordination | Splits "implement all ops-math operators" into per-operator sub-tasks |
+| **ExecutionAgent** | Code implementation, build, test | Writes op_api/op_host/op_kernel for a single operator |
+| **ReviewerAgent** *(planned)* | Code review, benchmark comparison | Validates correctness against reference, checks performance regressions |
 
 ### Design Principles
 
-1. **Unified agent interface** — All agents implement the same `Agent` trait. New agent types plug in without changing ResourceManager.
+1. **Unified Agent Interface** — All agents implement the same `Agent` trait. New agent types (Tester, Benchmarker) plug in without changing the orchestrator.
 
-2. **Tech-stack agnostic** — never hardcodes language-specific logic. Detects project type dynamically from descriptor files (`package.json`, `Cargo.toml`, `pyproject.toml`, `pom.xml`, etc.).
+2. **Parallel by Default** — OrchestratorAgent spawns multiple ExecutionAgents concurrently. N operators = N parallel workers.
 
-3. **Decoupled agent** — Agent runs as an independent async task, communicating with the TUI via channels and SSE event streams. The core library has zero TUI dependencies, which is also what makes the daemon possible.
+3. **Review Gate Integration** — Every implementation passes through [cannbot-skills](https://gitcode.com/cann/cannbot-skills) before merge. Automated lint, correctness validation, and benchmark checks.
 
-4. **Tool safety** — all destructive operations require explicit user approval. Tool failures become LLM observations, never panics.
+4. **Performance-Aware** — Agents understand CANN profiling output and can iterate on performance bottlenecks (vectorization, memory layout, tiling).
 
-5. **Context-aware** — token-budget-aware conversation windowing, project file-tree injection, and per-turn system reminders keep the model focused without exceeding context limits.
+5. **Accuracy First** — Automated comparison against reference implementations with tolerance-aware diff reporting.
+
+## Configuration
+
+```bash
+# Set your LLM provider
+/provider add anthropic --api-key $ANTHROPIC_API_KEY
+/provider default anthropic
+
+# Or use the built-in free quota
+/login
+```
+
+Supports OpenAI-compatible APIs, Anthropic, DeepSeek, MiniMax, GLM, Qwen, Ollama, and more.
 
 ## Project Instruction File
 
-Create a `.hydra.md` file in your project root to give Hydra persistent context:
+Create a `.hydra.md` file in your CANN project root:
 
 ```markdown
-# Project Instructions
+# CANN Operator Development Instructions
 
-This is a Vue 3 + TypeScript project using Pinia for state management.
-
-- Always use Composition API with `<script setup>`
-- Use TailwindCSS for styling, no inline styles
-- Run `npm run lint` after editing .vue/.ts files
+- Target platform: Ascend 910B, CANN 8.0.RC1
+- Operator categories: Math (Mul, Add, Pow), Activation (ReLU, GELU)
+- Code structure: op_api/op_host/op_kernel three-layer pattern
+- Test framework: ops-math test suite with gcov coverage
+- Performance target: within 5% of hand-tuned baseline
+- Use vectorization (Vector API) where applicable
 ```
 
-Hydra reads this file automatically and includes it in the system prompt.
+Hydra reads this automatically and includes it in every agent's system prompt.
 
 ## Development
 
-### Prerequisites
-
-- **Rust 1.88+** — install via [rustup](https://rustup.rs/)
-- **Git**
-- A supported LLM provider API key (for runtime testing)
-
-### Build from Source
-
 ```bash
-git clone https://atomgit.com/atomgit_atomcode/hydra.git
-cd hydra
+# Build
+cargo build -p hydra-daemon -p hydra-cli
 
-# Debug build (fast compilation, slower runtime)
-cargo build
-
-# Release build (slower compilation, optimized binary)
-cargo build --release
+# Run tests
+cargo test -p hydra-daemon
+cargo test -p hydra-core --test contract_connectivity
 ```
 
-### Run in Development
-
-```bash
-# Run the TUI directly (debug mode)
-cargo run -p hydra-cli
-
-# With arguments
-cargo run -p hydra-cli -- -C /path/to/project
-cargo run -p hydra-cli -- --model gpt-4o
-
-# Headless mode
-cargo run -p hydra-cli -- -p "summarize this repo"
-
-# Daemon (HTTP API)
-cargo run -p hydra-daemon
-```
-
-### Testing
-
-```bash
-# Run all tests
-cargo test
-
-# Run tests for a specific crate
-cargo test -p hydra-core
-cargo test -p hydra-tuix
-
-# Run a specific test
-cargo test -p hydra-core test_name
-```
-
-### Useful Commands
-
-```bash
-# Check compilation without building
-cargo check
-
-# Format code
-cargo fmt
-
-# Run linter
-cargo clippy
-
-# Build and install to ~/.cargo/bin
-cargo install --path crates/hydra-cli
-```
-
-## Contributing
-
-Contributions are welcome! Hydra is in active development.
-
-### How to Contribute
-
-1. **Fork** the repository on AtomGit
-2. **Clone** your fork locally:
-   ```bash
-   git clone https://atomgit.com/<your-username>/hydra.git
-   cd hydra
-   ```
-3. **Create a branch** for your change:
-   ```bash
-   git checkout -b feat/your-feature
-   # or
-   git checkout -b fix/your-bugfix
-   ```
-4. **Make your changes**, ensure the project builds and tests pass:
-   ```bash
-   cargo build && cargo test && cargo clippy
-   ```
-5. **Commit** with a clear message:
-   ```bash
-   git commit -m "feat: add xxx support"
-   ```
-6. **Push** and open a **Pull Request** against `main`
-
-### Branch Naming
-
-| Prefix | Purpose |
-|--------|---------|
-| `feat/` | New feature |
-| `fix/` | Bug fix |
-| `refactor/` | Code refactoring (no behavior change) |
-| `docs/` | Documentation only |
-| `chore/` | Build, CI, tooling changes |
-
-### Guidelines
-
-- Follow the project's core principles — especially **tech-stack neutrality**
-  (no language/framework-specific logic in the core engine; detect via probes
-  like `package.json` / `Cargo.toml` / `pom.xml` and route through adapters)
-- All tool failures must be graceful — return the error as an observation to the LLM, never panic
-- Destructive operations must require user approval
-- Keep the system prompt compact (~1.5K tokens)
-- Run `cargo fmt` and `cargo clippy` before submitting
-
-### Where to Start
-
-- **Add a new tool** — implement the `Tool` trait in `crates/hydra-core/src/tool/`
-- **Add a new provider** — implement `LlmProvider` in `crates/hydra-core/src/provider/`
-- **Improve the UI** — rendering lives in `crates/hydra-tuix/src/render/`
-- **Fix bugs** — check [Issues](https://atomgit.com/atomgit_atomcode/hydra/issues) for open bugs
+Full development guide: [docs/development-workflow.md](docs/development-workflow.md)
 
 ## Community
 
-Scan the QR code below with WeChat to join the Hydra community group — share feedback, report issues, and talk to other users and maintainers:
-
-<p align="center">
-  <img src="https://cdn-news.gitcode.com/news/Hydra_qun.png" alt="Hydra community QR code" width="220">
-</p>
+- [Report issues](https://github.com/lggyx/Hydra/issues)
+- [CANN operator review layer](https://gitcode.com/cann/cannbot-skills)
+- [Architecture deep dive](docs/architecture/README.md)
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
-
----
-
-<p align="center">
-  Built with Rust, ratatui, and a lot of late nights.
-</p>
+MIT — see [LICENSE](LICENSE)

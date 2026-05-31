@@ -1,6 +1,8 @@
 # hydra-daemon
 
-Hydra HTTP API 服务，提供对话历史查询、流式聊天、配置管理、Provider 管理等 RESTful 接口。
+Hydra HTTP API 服务，面向昇腾 CANN 算子开发测试场景，提供多智能体管理、流式聊天、Worktree/Branch 管理、Provider 管理等 RESTful 接口。
+
+审查层集成：[cannbot-skills](https://gitcode.com/cann/cannbot-skills)
 
 基于 [Axum](https://github.com/tokio-rs/axum) 框架构建，支持 SSE（Server-Sent Events）流式响应。
 
@@ -65,6 +67,44 @@ cargo run -p hydra-daemon -- --host 0.0.0.0 --port 8080
   "service": "hydra-daemon"
 }
 ```
+
+---
+
+### Agent 管理（CANN 算子开发核心）
+
+用于管理多智能体编排，是 CANN 算子并行开发测试的核心接口。
+
+#### `GET /api/v1/agents`
+
+列出所有 Agent。
+
+#### `POST /api/v1/agents`
+
+创建 Agent。支持 ExecutionAgent 和 OrchestratorAgent 两种类型。
+
+```json
+{"name": "mul-operator", "kind": "execution", "metadata": {"kind": "orchestrator"}}
+```
+
+#### `POST /api/v1/agents/:id/commands`
+
+向 Agent 发送指令（start / cancel / append_input）。
+
+#### `GET /api/v1/agents/:id/events`
+
+分页获取 Agent 事件历史。
+
+#### `GET /api/v1/agents/:id/events/stream`
+
+SSE 实时事件流，用于 TUI 实时监控算子开发进度。
+
+#### `GET /api/v1/worktrees` / `POST /api/v1/worktrees`
+
+Worktree 管理，每个算子可在独立 git worktree 中开发。
+
+#### `GET /api/v1/branches` / `POST /api/v1/branches`
+
+Git 分支管理。
 
 ---
 
@@ -689,6 +729,9 @@ hydra-daemon/
 ├── README.md
 └── src/
     ├── main.rs            # 主入口、路由定义、聊天流处理
+    ├── api_agent.rs       # Agent 管理（多智能体编排核心，CANN 算子并行开发）
+    ├── api_worktree.rs    # Worktree 管理接口
+    ├── api_branch.rs      # Branch 管理接口
     ├── api_auth.rs        # 认证相关接口（登录/登出/状态）
     ├── api_config.rs      # 配置相关接口及共享工具函数
     ├── api_provider.rs    # Provider 管理接口

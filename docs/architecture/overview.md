@@ -17,6 +17,9 @@
 | P3 | **Workspace isolation by default** | Every ExecutionAgent runs in its own git worktree. Two Agents never share a working directory. |
 | P4 | **LLM-driven decisions where possible** | Orchestrator uses a strong model for scheduling decisions instead of hard-coded rules. Rules are only safety floors. |
 | P5 | **Replaceable internals** | QualityGate, Provider, Tool, GitWorktreeManager are all trait-based. Swap implementations without touching orchestration logic. Test with fakes. |
+| P6 | **Domain-aware for CANN operators** | Agents understand the op_api/op_host/op_kernel three-layer pattern, CANN build system, and Ascend profiling toolchain. |
+| P7 | **Review gate integration** | All agent-produced code passes through [cannbot-skills](https://gitcode.com/cann/cannbot-skills) review layer before merge. Automated lint, correctness, performance, and accuracy checks. |
+| P8 | **Parallel by default** | N operators = N parallel ExecutionAgents. Orchestrator decomposes tasks and fans out to independent workers automatically. |
 
 ---
 
