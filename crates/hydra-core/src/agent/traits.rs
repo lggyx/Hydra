@@ -62,7 +62,7 @@ pub struct ResourceHandle {
 pub trait Agent: Send + Sync {
     fn id(&self) -> AgentId;
     fn kind(&self) -> AgentKind;
-    fn state(&self) -> &AgentState;
+    fn state_snapshot(&self) -> AgentState;
     fn branch(&self) -> Option<&str>;
     fn worktree(&self) -> Option<&Path>;
 

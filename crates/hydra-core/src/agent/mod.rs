@@ -5,6 +5,7 @@
 pub mod background;
 pub mod commands;
 pub mod events;
+pub mod execution;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
 pub mod sub_agent;
