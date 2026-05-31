@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{json_error, AppState, CachedMcpRegistry};
+use hydra_core::agent::resource_manager::ResourceManager;
 use hydra_core::config::Config;
 use hydra_core::mcp::{register_mcp_tools, McpRegistry};
 use hydra_core::provider;
@@ -221,6 +222,7 @@ pub struct AgentRegistry {
     active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
     mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     event_broadcasts: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
+    rm: ResourceManager,
 }
 
 impl AgentRegistry {
@@ -231,6 +233,7 @@ impl AgentRegistry {
             active_tokens: Arc::new(RwLock::new(HashMap::new())),
             mcp_cache,
             event_broadcasts: Arc::new(RwLock::new(HashMap::new())),
+            rm: ResourceManager::new(),
         }
     }
 

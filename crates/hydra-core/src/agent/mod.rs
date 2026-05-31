@@ -8,6 +8,7 @@ pub mod events;
 pub mod execution;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
+pub mod resource_manager;
 pub mod sub_agent;
 pub mod subtask_driver;
 pub mod traits;
