@@ -128,6 +128,22 @@ See [Permission Model](./docs/security/permission-model.md) for the full design 
 
 ## Installation
 
+### Install Script
+
+```bash
+curl -fsSL https://atomgit.com/atomgit_atomcode/hydra/releases/download/v4.23.3/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://atomgit.com/atomgit_atomcode/hydra/releases/download/v4.23.3/install.ps1 | iex
+```
+
+The script downloads the matching release binary for your platform and installs
+`hydra` into `/usr/local/bin` or `~/.local/bin` on macOS / Linux / HarmonyOS PC,
+and into `%LOCALAPPDATA%\Hydra` on Windows.
+
 ### From Source (recommended)
 
 ```bash

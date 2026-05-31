@@ -91,6 +91,18 @@ jobs:
             --file-path=dist/hydra-${TAG_NAME}-darwin-x64 \
             --access-token=${{ secrets.ACCESS_TOKEN }}
 
+      # 1️⃣2️⃣ 上传 macOS / Linux / HarmonyOS 一键安装脚本
+      - name: Upload install.sh
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+
+          python3 .github/workflows/create_tag_release.py \
+            --tag-name=${TAG_NAME} \
+            --file-name=install.sh \
+            --file-path=scripts/install.sh \
+            --access-token=${{ secrets.ACCESS_TOKEN }}
+
   build-linux:
     runs-on: ubuntu-latest
 
@@ -258,4 +270,17 @@ jobs:
             --tag-name=${TAG_NAME} \
             --file-name=hydra-${TAG_NAME}-windows-x64.exe \
             --file-path=dist/hydra-${TAG_NAME}-windows-x64.exe \
+            --access-token=${{ secrets.ACCESS_TOKEN }}
+
+      # 🔟 上传 Windows 一键安装脚本
+      - name: Upload install.ps1
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+
+          python3 .github/workflows/create_tag_release.py \
+            --tag-name=${TAG_NAME} \
+            --file-name=install.ps1 \
+            --file-path=scripts/install.ps1 \
             --access-token=${{ secrets.ACCESS_TOKEN }}

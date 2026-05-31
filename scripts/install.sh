@@ -1,7 +1,7 @@
 #!/bin/sh
 # Hydra installer — curl | sh
 #
-#   curl -fsSL https://atomgit.com/atomgit_atomcode/hydra/raw/main/install.sh | sh
+#   curl -fsSL https://atomgit.com/atomgit_atomcode/hydra/releases/download/v4.23.3/install.sh | sh
 #
 # Env overrides:
 #   HYDRA_VERSION   release tag to install (default: v4.23.3)
