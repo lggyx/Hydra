@@ -2054,15 +2054,16 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                 }
             }
         }
-        [sub] if sub.eq_ignore_ascii_case("new") || sub.eq_ignore_ascii_case("create") => {
+        [sub, rest @ ..] if sub.eq_ignore_ascii_case("new") || sub.eq_ignore_ascii_case("create") => {
+            let arg = rest.join(" ");
             let mut payload = serde_json::json!({});
-            if let Some(worktree) = parse_arg(arg, &["--worktree", "-w"]) {
+            if let Some(worktree) = parse_arg(&arg, &["--worktree", "-w"]) {
                 payload["worktree_id"] = serde_json::json!(worktree);
             }
-            if let Some(branch) = parse_arg(arg, &["--branch", "-b"]) {
+            if let Some(branch) = parse_arg(&arg, &["--branch", "-b"]) {
                 payload["branch_name"] = serde_json::json!(branch);
             }
-            if let Some(kind) = parse_arg(arg, &["--kind", "-k"]) {
+            if let Some(kind) = parse_arg(&arg, &["--kind", "-k"]) {
                 payload["metadata"] = serde_json::json!({"kind": kind});
             }
             match agents_post("/api/v1/agents", &payload) {
