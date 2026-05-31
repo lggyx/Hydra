@@ -836,6 +836,7 @@ impl hydra_core::agent::orchestrator::AgentControl for AgentControlBridge {
         // Spawn the execution in a background thread (not tokio, since we're in block_in_place)
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async {

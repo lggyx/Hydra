@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use serde::Deserialize;
 use tokio::sync::{Notify, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -94,6 +95,9 @@ impl Agent for OrchestratorAgent {
             s.updated_at = now_ts();
         }
         self.control.set_self_status("running");
+
+        // Drain any stale notifications (e.g. from on_command before run)
+        while self.notify.notified().now_or_never().is_some() {}
 
         let working_dir_path = self.working_dir.clone();
         let tool_context = crate::tool::ToolContext::new(working_dir_path.clone());
@@ -195,7 +199,6 @@ impl Agent for OrchestratorAgent {
             }
             super::commands::AgentCommand::SubmitTask { description } => {
                 self.pending_input = Some(description);
-                self.notify.notify_one();
                 AgentResponse::Ack
             }
             super::commands::AgentCommand::Pause | super::commands::AgentCommand::Resume => {
