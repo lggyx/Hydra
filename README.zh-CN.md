@@ -198,23 +198,28 @@ hydra
 <a name="算子开发工作流"></a>
 ## 算子开发工作流
 
-```
-用户任务："实现 Mul、Add、Pow 算子的端到端测试"
-       │
-       ▼
-  OrchestratorAgent  ── 任务分解
-       │
-       ├── spawn_execution("Mul: op_api + op_host + op_kernel")  →  ExecutionAgent #1
-       ├── spawn_execution("Add: op_api + op_host + op_kernel")  →  ExecutionAgent #2
-       └── spawn_execution("Pow: op_api + op_host + op_kernel")  →  ExecutionAgent #3
-                                          │
-                                          ▼
-                                   cannbot-skills 审查层
-                                   ├── Lint & 类型安全
-                                   ├── 正确性 vs 参考实现
-                                   ├── 性能基准对比
-                                   ├── 精度验证
-                                   └── 合入门禁
+```mermaid
+flowchart TB
+    U[用户任务: 实现 Mul, Add, Pow 算子]
+    U --> O[OrchestratorAgent]
+    O --> |spawn_execution| E1[ExecutionAgent #1: Mul]
+    O --> |spawn_execution| E2[ExecutionAgent #2: Add]
+    O --> |spawn_execution| E3[ExecutionAgent #3: Pow]
+
+    E1 --> |op_api + op_host + op_kernel| B1[编译 + 测试]
+    E2 --> |op_api + op_host + op_kernel| B2[编译 + 测试]
+    E3 --> |op_api + op_host + op_kernel| B3[编译 + 测试]
+
+    B1 --> R[cannbot-skills 审查层]
+    B2 --> R
+    B3 --> R
+
+    R --> |Lint + 正确性 + 性能 + 精度| G{合入门禁}
+    G --> |通过| F[declare_complete]
+    G --> |失败| FB[自动反馈给 Agent]
+    FB --> E1
+    FB --> E2
+    FB --> E3
 ```
 
 详细工作流：[docs/cann-operator-workflow.zh.md](docs/cann-operator-workflow.zh.md)
@@ -223,6 +228,59 @@ hydra
 
 <a name="架构"></a>
 ## 架构
+
+### 系统拓扑
+
+```mermaid
+flowchart TB
+    subgraph "用户界面"
+        CLI["hydra CLI"]
+        TUI["TUI Monitor"]
+    end
+
+    subgraph "API 层"
+        REST["REST Server<br/>axum"]
+        SSE["SSE Event Stream"]
+    end
+
+    subgraph "核心引擎"
+        RM["ResourceManager"]
+        REG["AgentRegistry"]
+        BUS["EventBus"]
+        TOOLS["ToolRegistry"]
+    end
+
+    subgraph "Agent 层"
+        E1["ExecutionAgent #1"]
+        E2["ExecutionAgent #2"]
+        O1["OrchestratorAgent"]
+    end
+
+    subgraph "CANN 审查"
+        CANN["cannbot-skills<br/>审查层"]
+    end
+
+    CLI --> REST
+    TUI --> REST
+    TUI --> SSE
+
+    REST --> RM
+    SSE --> BUS
+
+    RM --> REG
+    RM --> BUS
+    RM --> TOOLS
+
+    BUS --> O1
+    O1 --> E1
+    O1 --> E2
+
+    E1 --> CANN
+    E2 --> CANN
+    CANN --> RM
+```
+
+### Crate 结构
 
 ```
 hydra/
@@ -248,6 +306,23 @@ hydra/
 | **OrchestratorAgent** | 任务分解、协调调度 | 将 ops-math 拆分为每个算子的子任务 |
 | **ExecutionAgent** | 代码实现、编译、测试 | 为单个算子编写 op_api/host/kernel |
 | **ReviewerAgent** *(规划中)* | 代码审查、跑分对比 | cannbot-skills: lint、正确性、性能、精度 |
+
+### Agent 生命周期
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created
+    Created --> Running : spawn
+    Running --> Running : turn loop
+    Running --> WaitingInput : respond
+    WaitingInput --> Running : append_input
+    Running --> Completed : declare_complete
+    Running --> Killed : cancel
+    Running --> Failed : error
+    Completed --> [*]
+    Killed --> [*]
+    Failed --> [*]
+```
 
 ### 设计原则
 

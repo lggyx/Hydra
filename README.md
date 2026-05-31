@@ -198,23 +198,28 @@ hydra
 <a name="workflow"></a>
 ## Operator Development Workflow
 
-```
-User task: "实现 Mul、Add、Pow 算子的端到端测试"
-       │
-       ▼
-  OrchestratorAgent  ── Task decomposition
-       │
-       ├── spawn_execution("Mul: op_api + op_host + op_kernel")  →  ExecutionAgent #1
-       ├── spawn_execution("Add: op_api + op_host + op_kernel")  →  ExecutionAgent #2
-       └── spawn_execution("Pow: op_api + op_host + op_kernel")  →  ExecutionAgent #3
-                                          │
-                                          ▼
-                                   cannbot-skills Review Layer
-                                   ├── Lint & type safety
-                                   ├── Correctness vs reference
-                                   ├── Performance benchmark
-                                   ├── Accuracy verification
-                                   └── Merge gate
+```mermaid
+flowchart TB
+    U[User Task: implement Mul, Add, Pow operators]
+    U --> O[OrchestratorAgent]
+    O --> |spawn_execution| E1[ExecutionAgent #1: Mul]
+    O --> |spawn_execution| E2[ExecutionAgent #2: Add]
+    O --> |spawn_execution| E3[ExecutionAgent #3: Pow]
+
+    E1 --> |op_api + op_host + op_kernel| B1[Build + Test]
+    E2 --> |op_api + op_host + op_kernel| B2[Build + Test]
+    E3 --> |op_api + op_host + op_kernel| B3[Build + Test]
+
+    B1 --> R[cannbot-skills Review Layer]
+    B2 --> R
+    B3 --> R
+
+    R --> |Lint + Correctness + Perf + Accuracy| G{Merge Gate}
+    G --> |Pass| F[declare_complete]
+    G --> |Fail| FB[Auto-feedback to Agent]
+    FB --> E1
+    FB --> E2
+    FB --> E3
 ```
 
 Detailed workflow: [docs/cann-operator-workflow.md](docs/cann-operator-workflow.md)
@@ -223,6 +228,59 @@ Detailed workflow: [docs/cann-operator-workflow.md](docs/cann-operator-workflow.
 
 <a name="architecture"></a>
 ## Architecture
+
+### System Topology
+
+```mermaid
+flowchart TB
+    subgraph "User Interface"
+        CLI["hydra CLI"]
+        TUI["TUI Monitor"]
+    end
+
+    subgraph "API Layer"
+        REST["REST Server<br/>axum"]
+        SSE["SSE Event Stream"]
+    end
+
+    subgraph "Core Engine"
+        RM["ResourceManager"]
+        REG["AgentRegistry"]
+        BUS["EventBus"]
+        TOOLS["ToolRegistry"]
+    end
+
+    subgraph "Agent Layer"
+        E1["ExecutionAgent #1"]
+        E2["ExecutionAgent #2"]
+        O1["OrchestratorAgent"]
+    end
+
+    subgraph "CANN Review"
+        CANN["cannbot-skills<br/>Review Layer"]
+    end
+
+    CLI --> REST
+    TUI --> REST
+    TUI --> SSE
+
+    REST --> RM
+    SSE --> BUS
+
+    RM --> REG
+    RM --> BUS
+    RM --> TOOLS
+
+    BUS --> O1
+    O1 --> E1
+    O1 --> E2
+
+    E1 --> CANN
+    E2 --> CANN
+    CANN --> RM
+```
+
+### Crate Structure
 
 ```
 hydra/
@@ -248,6 +306,23 @@ hydra/
 | **OrchestratorAgent** | Task decomposition, coordination | Splits ops-math into per-operator sub-tasks |
 | **ExecutionAgent** | Implementation, build, test | Writes op_api/host/kernel per operator |
 | **ReviewerAgent** *(planned)* | Code review, benchmark | cannbot-skills: lint, correctness, perf, accuracy |
+
+### Agent Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created
+    Created --> Running : spawn
+    Running --> Running : turn loop
+    Running --> WaitingInput : respond
+    WaitingInput --> Running : append_input
+    Running --> Completed : declare_complete
+    Running --> Killed : cancel
+    Running --> Failed : error
+    Completed --> [*]
+    Killed --> [*]
+    Failed --> [*]
+```
 
 ### Design Principles
 
