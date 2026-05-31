@@ -770,14 +770,23 @@ async fn run_orchestrator_execution(
                 _ => continue,
             };
             // Store + broadcast
-            let mut es = fwd_event_store.blocking_write();
-            let seq = es.events.get(&fwd_agent_id).map(|v| v.len() as u64 + 1).unwrap_or(1);
-            let mut daemon_evt = daemon_evt;
-            daemon_evt.seq = seq;
-            es.append(&fwd_agent_id, daemon_evt.clone());
-            drop(es);
-            if let Some(tx) = fwd_broadcasts.blocking_read().get(&fwd_agent_id) {
-                let _ = tx.send(daemon_evt);
+            let seq = {
+                let es = fwd_event_store.read().await;
+                es.events.get(&fwd_agent_id).map(|v| v.len() as u64 + 1).unwrap_or(1)
+            };
+            let stored_evt = AgentEvent {
+                seq,
+                agent_id: daemon_evt.agent_id.clone(),
+                event_type: daemon_evt.event_type.clone(),
+                timestamp: daemon_evt.timestamp,
+                payload: daemon_evt.payload.clone(),
+            };
+            {
+                let mut es = fwd_event_store.write().await;
+                es.append(&fwd_agent_id, stored_evt.clone());
+            }
+            if let Some(tx) = fwd_broadcasts.read().await.get(&fwd_agent_id) {
+                let _ = tx.send(stored_evt);
             }
         }
     });
