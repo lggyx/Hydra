@@ -47,19 +47,41 @@ CANN 算子开发涉及大量重复的模式化工作——`op_api`、`op_host`�
 - **精度验证** — 与参考实现自动对比，支持容差感知的差异报告
 - **全流程自动化** — 从读取 ops-math 规格到输出通过测试覆盖的代码，全程自主完成
 
-## 快速开始
+## 安装
+
+### 一行安装
+
+**Linux / macOS：**
+```bash
+curl -fsSL https://raw.githubusercontent.com/lggyx/Hydra/main/install.sh | bash
+```
+
+**Windows（PowerShell）：**
+```powershell
+iwr -useb https://raw.githubusercontent.com/lggyx/Hydra/main/install.ps1 | iex
+```
+
+### 从源码构建
 
 ```bash
-# 从源码安装（需要 Rust 1.88+）
+# 需要 Rust 1.88+
 git clone https://github.com/lggyx/Hydra.git
 cd Hydra
 cargo build --release
 
+# 或用安装脚本的 --build-from-source 选项
+bash install.sh --build-from-source
+# .\install.ps1 -BuildFromSource    (Windows)
+```
+
+## 快速开始
+
+```bash
 # 启动守护进程
-cargo run -p hydra-daemon
+hydra-daemon
 
 # 另一个终端启动 TUI
-cargo run -p hydra
+hydra
 
 # 在 TUI 中：
 /login                             # 领取免费 API 配额

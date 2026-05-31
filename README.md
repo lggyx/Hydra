@@ -47,19 +47,40 @@ CANN operator development involves repetitive, pattern-heavy work across `op_api
 - **Accuracy verification** — Automated correctness checks against reference implementations with structured diff reporting
 - **End-to-end automation** — From reading the ops-math spec to producing passing test coverage, fully autonomous
 
-## Quick Start
+## Installation
+
+### One-line install
+
+**Linux / macOS:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/lggyx/Hydra/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+iwr -useb https://raw.githubusercontent.com/lggyx/Hydra/main/install.ps1 | iex
+```
+
+### From source
 
 ```bash
-# Install from source (Rust 1.88+)
+# Requires Rust 1.88+
 git clone https://github.com/lggyx/Hydra.git
 cd Hydra
 cargo build --release
 
+# Or use the install script with --build-from-source
+bash install.sh --build-from-source
+# .\install.ps1 -BuildFromSource    (Windows)
+```
+
+## Quick Start
+
 # Start the daemon
-cargo run -p hydra-daemon
+hydra-daemon
 
 # In another terminal, start the TUI
-cargo run -p hydra
+hydra
 
 # In the TUI:
 /login                             # Get free API quota
