@@ -182,6 +182,25 @@ impl Agent for OrchestratorAgent {
                         s.updated_at = now_ts();
                     }
                     self.control.set_self_status("waiting_input");
+                    // Report child agent progress to the user
+                    let children = self.control.list_agents();
+                    let mut child_report = String::from("\n  Child agents:\n");
+                    let mut has_children = false;
+                    for (cid, cstatus) in &children {
+                        let short_id = &cid[..8.min(cid.len())];
+                        let short_status = if cstatus.len() > 20 { &cstatus[..20] } else { cstatus };
+                        child_report.push_str(&format!("    {}  {}\n", short_id, short_status));
+                        has_children = true;
+                    }
+                    if !has_children {
+                        child_report.push_str("    (none)\n");
+                    }
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(AgentEvent::Turn {
+                            agent_id: self.id,
+                            data: serde_json::json!({"delta": child_report}),
+                        });
+                    }
                     tokio::select! {
                         _ = self.notify.notified() => continue,
                         _ = self.cancel_token.cancelled() => {
