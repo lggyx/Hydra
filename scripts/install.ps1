@@ -1,6 +1,6 @@
 # Hydra installer for Windows — PowerShell
 #
-#   irm https://atomgit.com/atomgit_atomcode/hydra/raw/main/install.ps1 | iex
+#   irm https://github.com/lggyx/Hydra/releases/download/v4.23.3/install.ps1 | iex
 #
 # Env overrides:
 #   $env:HYDRA_VERSION   release tag to install (default: v4.23.3)
@@ -13,7 +13,7 @@
 $ErrorActionPreference = "Stop"
 
 $Version = if ($env:HYDRA_VERSION) { $env:HYDRA_VERSION } else { "v4.23.3" }
-$RepoBase = "https://atomgit.com/atomgit_atomcode/hydra/releases/download"
+$RepoBase = "https://github.com/lggyx/Hydra/releases/download"
 
 # --- detect arch ---
 # Prefer PROCESSOR_ARCHITEW6432 (set only when a 32-bit process runs on a 64-bit

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Hydra installer — curl | sh
 #
-#   curl -fsSL https://atomgit.com/atomgit_atomcode/hydra/raw/main/install.sh | sh
+#   curl -fsSL https://github.com/lggyx/Hydra/releases/download/v4.23.3/install.sh | sh
 #
 # Env overrides:
 #   HYDRA_VERSION   release tag to install (default: v4.23.3)
@@ -14,7 +14,7 @@
 set -eu
 
 VERSION="${HYDRA_VERSION:-v4.23.3}"
-REPO_BASE="https://atomgit.com/atomgit_atomcode/hydra/releases/download"
+REPO_BASE="https://github.com/lggyx/Hydra/releases/download"
 
 # --- detect platform ---
 uname_s=$(uname -s)
