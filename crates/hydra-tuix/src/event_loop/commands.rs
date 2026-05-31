@@ -2206,18 +2206,18 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                                 let mut out = String::from("  Events:\n");
                                 for ev in events.iter().rev().take(20).rev() {
                                     let seq = ev["seq"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
-                                    let etype = ev["type"].as_str().unwrap_or("-");
+                                    let etype = ev["event_type"].as_str().unwrap_or("-");
                                     let ts = ev["timestamp"].as_u64().map(|t| t.to_string()).unwrap_or_else(|| "-".to_string());
-                                    let preview = ev["data"]
-                                        .as_str()
-                                        .or_else(|| ev["text"].as_str())
-                                        .unwrap_or("")
-                                        .chars()
-                                        .take(60)
-                                        .collect::<String>();
+                                    let preview = if let Some(delta) = ev["payload"].get("delta").and_then(|v| v.as_str()) {
+                                        delta.chars().take(80).collect()
+                                    } else if let Some(tool) = ev["payload"].get("tool").and_then(|v| v.as_str()) {
+                                        format!("tool:{}", tool)
+                                    } else {
+                                        String::new()
+                                    };
                                     out.push_str(&format!(
-                                        "    [{}] {} (ts:{}) {}\n",
-                                        seq, etype, ts, preview
+                                        "    [{}] {}  {}\n",
+                                        seq, etype, preview
                                     ));
                                 }
                                 renderer.render(UiLine::CommandOutput(out));
