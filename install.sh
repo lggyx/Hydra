@@ -53,19 +53,10 @@ esac
 BIN_DIR="$INSTALL_DIR/bin"
 mkdir -p "$BIN_DIR"
 
-if $BUILD_FROM_SOURCE; then
-    echo "Building from source..."
-    if ! command -v cargo &>/dev/null; then
-        echo "Error: Rust (cargo) is required. Install from https://rustup.rs/"
-        exit 1
-    fi
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    cd "$SCRIPT_DIR"
-    cargo build --release -p hydra-daemon -p hydra
-    cp target/release/hydra-daemon "$BIN_DIR/"
-    cp target/release/hydra "$BIN_DIR/"
-else
-    # Download from GitHub releases
+INSTALLED=false
+
+if ! $BUILD_FROM_SOURCE; then
+    # Try downloading from GitHub releases
     if [ "$VERSION" = "latest" ]; then
         BASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download"
     else
@@ -77,49 +68,43 @@ else
         "hydra|${BASE_URL}/hydra-${OS_NAME}-${ARCH_NAME}"
     )
 
-    DOWNLOAD_OK=true
     for FILE_SPEC in "${FILES[@]}"; do
         NAME="${FILE_SPEC%%|*}"
         URL="${FILE_SPEC##*|}"
         DEST="$BIN_DIR/$NAME"
         echo "Downloading $NAME..."
         if command -v curl &>/dev/null; then
-            curl -fsSL "$URL" -o "$DEST" || DOWNLOAD_OK=false
+            curl -fsSL "$URL" -o "$DEST" && chmod +x "$DEST" && INSTALLED=true || {
+                echo "Download failed, will build from source..."
+                break
+            }
         elif command -v wget &>/dev/null; then
-            wget -q "$URL" -O "$DEST" || DOWNLOAD_OK=false
-        else
-            echo "Error: curl or wget required"
-            exit 1
+            wget -q "$URL" -O "$DEST" && chmod +x "$DEST" && INSTALLED=true || {
+                echo "Download failed, will build from source..."
+                break
+            }
         fi
-        if ! $DOWNLOAD_OK; then
-            echo "Download failed: $URL"
-            echo "No pre-built release found for $VERSION. Building from source..."
-            BUILD_FROM_SOURCE=true
-            break
-        fi
-        chmod +x "$DEST"
     done
+fi
 
-    if $BUILD_FROM_SOURCE; then
-        if ! command -v cargo &>/dev/null; then
-            echo "Error: Rust (cargo) is required. Install from https://rustup.rs/"
-            echo "Or wait for pre-built releases at https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
-            exit 1
-        fi
-        echo "Building from source..."
-        # Check if we're in the repo (pip installed) or need to clone
-        if [ -f "Cargo.toml" ] && grep -q "Hydra" Cargo.toml 2>/dev/null; then
-            cargo build --release -p hydra-daemon -p hydra
-        else
-            TMPDIR="$(mktemp -d)"
-            git clone "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$TMPDIR"
-            cd "$TMPDIR"
-            cargo build --release -p hydra-daemon -p hydra
-            rm -rf "$TMPDIR"
-        fi
-        cp target/release/hydra-daemon "$BIN_DIR/"
-        cp target/release/hydra "$BIN_DIR/"
+if ! $INSTALLED; then
+    echo "Building from source..."
+    if ! command -v cargo &>/dev/null; then
+        echo "Error: Rust (cargo) is required. Install from https://rustup.rs/"
+        echo "Pre-built releases: https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
+        exit 1
     fi
+    if [ -f "Cargo.toml" ] && grep -q "hydra" Cargo.toml 2>/dev/null; then
+        cargo build --release -p hydra-daemon -p hydra
+    else
+        TMPDIR="$(mktemp -d)"
+        git clone "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$TMPDIR"
+        cd "$TMPDIR"
+        cargo build --release -p hydra-daemon -p hydra
+    fi
+    cp target/release/hydra-daemon "$BIN_DIR/"
+    cp target/release/hydra "$BIN_DIR/"
+    INSTALLED=true
 fi
 
 # Add to PATH
