@@ -60,7 +60,7 @@
 
 ---
 
-## 3. 核心抽象 *(规划态)*
+## 3. 核心抽象
 
 ### 3.1 Agent trait（统一接口）
 
@@ -274,7 +274,7 @@ pub struct AgentMetrics {
 
 ---
 
-## 4. ResourceManager（路由器） *(规划态)*
+## 4. ResourceManager（路由器）
 
 ResourceManager 是**唯一**持有 Agent 可变引用的组件。其他所有模块都是只读观察。
 
@@ -319,7 +319,7 @@ impl ResourceManager {
 
 ---
 
-## 5. Agent 实现 *(规划态)*
+## 5. Agent 实现
 
 ### 5.1 ExecutionAgent（执行者）
 

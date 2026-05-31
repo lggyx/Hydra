@@ -330,7 +330,11 @@ Hydra is a Rust workspace with four crates:
 hydra/
   crates/
     hydra-core/     # Headless library — no TUI dependency
-      agent/           # AgentLoop: autonomous tool-use loop
+      agent/           # Agent trait, ExecutionAgent, OrchestratorAgent
+        traits.rs        # Agent trait, AgentId, AgentKind, AgentState
+        execution.rs     # ExecutionAgent — full TurnRunner-backed worker
+        orchestrator.rs  # OrchestratorAgent — spawn/kill/inspect child agents
+        resource_manager.rs  # Agent registry + event fan-out
       turn/            # TurnRunner, datalog, permission decider
       config/          # Config loading, provider configs
       conversation/    # Message types, windowed context
@@ -349,17 +353,40 @@ hydra/
       auth/            # Hydra OAuth client
 
     hydra-daemon/   # HTTP/SSE API server over hydra-core
+      api_agent.rs     # Agent API: create, start, cancel, events, SSE stream
+      api_worktree.rs  # Worktree management endpoints
+      api_branch.rs    # Branch management endpoints
 ```
+
+### Agent Architecture
+
+Hydra implements a multi-agent system based on a unified `Agent` trait:
+
+```
+OrchestratorAgent ("do the task")
+    │
+    ├── spawn_execution("write the API")
+    │   └── ExecutionAgent → TurnRunner → LLM + tools
+    ├── spawn_execution("build the UI")
+    │   └── ExecutionAgent → TurnRunner → LLM + tools
+    └── inspect_agent / kill_agent / declare_complete
+```
+
+- **ExecutionAgent** — A worker agent that runs an LLM turn loop with full tool access (bash, edit, read, write, MCP, LSP). Used via `/agents create`.
+- **OrchestratorAgent** — A manager agent that spawns child execution agents, monitors their progress, and reports results. Used via `/agents create --kind orchestrator`. Supports multi-turn conversation with `waiting_input` state.
+- **ResourceManager** — Tracks agent states, fans out events to subscribers, provides `spawn`/`send_command`/`subscribe` interface.
 
 ### Design Principles
 
-1. **Tech-stack agnostic** — never hardcodes language-specific logic. Detects project type dynamically from descriptor files (`package.json`, `Cargo.toml`, `pyproject.toml`, `pom.xml`, etc.).
+1. **Unified agent interface** — All agents implement the same `Agent` trait. New agent types plug in without changing ResourceManager.
 
-2. **Decoupled agent** — `AgentLoop` runs as an independent async task, communicating with the TUI via channels (`AgentCommand` / `AgentEvent`). The core library has zero TUI dependencies, which is also what makes the daemon possible.
+2. **Tech-stack agnostic** — never hardcodes language-specific logic. Detects project type dynamically from descriptor files (`package.json`, `Cargo.toml`, `pyproject.toml`, `pom.xml`, etc.).
 
-3. **Tool safety** — all destructive operations require explicit user approval. Tool failures become LLM observations, never panics.
+3. **Decoupled agent** — Agent runs as an independent async task, communicating with the TUI via channels and SSE event streams. The core library has zero TUI dependencies, which is also what makes the daemon possible.
 
-4. **Context-aware** — token-budget-aware conversation windowing, project file-tree injection, and per-turn system reminders keep the model focused without exceeding context limits.
+4. **Tool safety** — all destructive operations require explicit user approval. Tool failures become LLM observations, never panics.
+
+5. **Context-aware** — token-budget-aware conversation windowing, project file-tree injection, and per-turn system reminders keep the model focused without exceeding context limits.
 
 ## Project Instruction File
 
