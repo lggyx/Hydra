@@ -107,9 +107,16 @@ else
             exit 1
         fi
         echo "Building from source..."
-        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-        cd "$SCRIPT_DIR"
-        cargo build --release -p hydra-daemon -p hydra
+        # Check if we're in the repo (pip installed) or need to clone
+        if [ -f "Cargo.toml" ] && grep -q "Hydra" Cargo.toml 2>/dev/null; then
+            cargo build --release -p hydra-daemon -p hydra
+        else
+            TMPDIR="$(mktemp -d)"
+            git clone "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$TMPDIR"
+            cd "$TMPDIR"
+            cargo build --release -p hydra-daemon -p hydra
+            rm -rf "$TMPDIR"
+        fi
         cp target/release/hydra-daemon "$BIN_DIR/"
         cp target/release/hydra "$BIN_DIR/"
     fi
