@@ -168,7 +168,14 @@ impl Agent for OrchestratorAgent {
 
             match result {
                 crate::turn::event::TurnResult::Responded { text, .. } => {
-                    last_response = text;
+                    last_response = text.clone();
+                    // Forward full response as event for TUI visibility
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(AgentEvent::Turn {
+                            agent_id: self.id,
+                            data: serde_json::json!({"delta": text}),
+                        });
+                    }
                     {
                         let mut s = self.state.write().await;
                         s.status = AgentStatus::WaitingInput;
