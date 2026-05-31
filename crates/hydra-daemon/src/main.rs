@@ -3297,4 +3297,119 @@ mod tests {
         assert_eq!(detail["name"], "contract-smoke");
         assert_eq!(detail["message_count"], 0);
     }
+
+    fn test_router_with_agents(state: AppState) -> Router {
+        Router::new()
+            .route("/api/v1/agents", get(api_agent::list_agents).post(api_agent::create_agent))
+            .route("/api/v1/agents/:id", get(api_agent::get_agent))
+            .route("/api/v1/agents/:id/commands", post(api_agent::post_agent_command))
+            .route("/api/v1/agents/:id/events", get(api_agent::list_agent_events))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn agent_smoke_create_list_start_events() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hydra_home = temp.path().join("hydra-home");
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let _home_guard = EnvVarGuard::set("HYDRA_HOME", hydra_home.to_str().expect("utf8 path"));
+
+        let app = test_router_with_agents(test_app_state(project_dir.clone(), hydra_home.clone()));
+
+        // 1. Create agent
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/agents")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "name": "smoke-agent",
+                    "working_dir": project_dir.to_str().unwrap()
+                })
+                .to_string(),
+            ))
+            .expect("build create request");
+        let response = app.clone().oneshot(create_req).await.expect("create agent");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let created: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        let agent_id = created["agent"]["id"].as_str().expect("agent id").to_string();
+        assert_eq!(created["agent"]["name"], "smoke-agent");
+        assert_eq!(created["agent"]["status"], "created");
+
+        // 2. List agents — should include the new agent
+        let list_req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/agents")
+            .body(Body::empty())
+            .expect("build list request");
+        let response = app.clone().oneshot(list_req).await.expect("list agents");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let list: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        let items = list["items"].as_array().expect("items array");
+        assert!(items.iter().any(|a| a["id"] == agent_id));
+
+        // 3. Get agent detail
+        let get_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/agents/{}", agent_id))
+            .body(Body::empty())
+            .expect("build get request");
+        let response = app.clone().oneshot(get_req).await.expect("get agent");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let detail: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(detail["agent"]["status"], "created");
+
+        // 4. Start agent — triggers mock progression fallback (no real provider config)
+        let start_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/agents/{}/commands", agent_id))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"type": "start"}).to_string(),
+            ))
+            .expect("build start request");
+        let response = app.clone().oneshot(start_req).await.expect("start agent");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let cmd_resp: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(cmd_resp["accepted"], true);
+        assert_eq!(cmd_resp["status_before"], "created");
+        assert_eq!(cmd_resp["status_after"], "queued");
+
+        // 5. Wait for mock progression to complete (100ms sleep + status changes)
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // 6. Verify agent reached completed state
+        let get_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/agents/{}", agent_id))
+            .body(Body::empty())
+            .expect("build get request");
+        let response = app.clone().oneshot(get_req).await.expect("get agent");
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let detail: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        assert_eq!(detail["agent"]["status"], "completed");
+
+        // 7. Check events exist
+        let events_req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/agents/{}/events?after_seq=0&limit=10", agent_id))
+            .body(Body::empty())
+            .expect("build events request");
+        let response = app.clone().oneshot(events_req).await.expect("get events");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let events: serde_json::Value = serde_json::from_slice(&body).expect("parse");
+        let evt_items = events["items"].as_array().expect("events array");
+        assert!(!evt_items.is_empty(), "should have at least one event");
+        let has_status = evt_items
+            .iter()
+            .any(|e| e["event_type"] == "status_changed");
+        assert!(has_status, "should have status_changed events");
+    }
 }
