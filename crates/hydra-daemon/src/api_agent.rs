@@ -883,6 +883,10 @@ impl hydra_core::agent::orchestrator::AgentControl for AgentControlBridge {
         let active_tokens = self.active_tokens.clone();
         let mcp_cache = self.mcp_cache.clone();
         let working_dir = self.default_working_dir.clone();
+        // Read the task from pending_input
+        let input_text = tokio::task::block_in_place(|| {
+            self.store.blocking_read().get(id).and_then(|a| a.pending_input.clone())
+        });
         // Update status first
         tokio::task::block_in_place(|| {
             self.store.blocking_write().update_status(id, AgentStatus::Queued);
@@ -902,7 +906,7 @@ impl hydra_core::agent::orchestrator::AgentControl for AgentControlBridge {
                     event_broadcasts.clone(),
                     child_id.clone(),
                     working_dir,
-                    None,
+                    input_text,
                     cancel_token,
                     mcp_cache,
                 ).await;
