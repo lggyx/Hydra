@@ -346,6 +346,12 @@ fn forward_turn_event(
                     data: serde_json::json!({"delta": text}),
                 });
             }
+            TurnEvent::ReasoningDelta(text) => {
+                let _ = tx.send(AgentEvent::Turn {
+                    agent_id,
+                    data: serde_json::json!({"delta": format!("[reasoning] {}", text)}),
+                });
+            }
             TurnEvent::ToolCallStarted { name, .. } | TurnEvent::ToolCallStreaming { name, .. } => {
                 let _ = tx.send(AgentEvent::ToolCall {
                     agent_id,
