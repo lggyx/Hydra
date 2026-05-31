@@ -71,7 +71,7 @@
 
 ---
 
-## 3. Core Abstractions *(规划态)*
+## 3. Core Abstractions
 
 ### 3.1 Agent Trait (universal interface)
 
@@ -347,7 +347,7 @@ pub struct AgentMetrics {
 
 ---
 
-## 4. ResourceManager (the router) *(规划态)*
+## 4. ResourceManager (the router)
 
 ResourceManager is the **only** component that directly addresses agents by ID.
 All other components interact through channels or read-only snapshots.
@@ -442,7 +442,7 @@ impl ResourceManager {
 
 ---
 
-## 5. Agent Implementations *(规划态)*
+## 5. Agent Implementations
 
 ### 5.1 ExecutionAgent (the worker)
 

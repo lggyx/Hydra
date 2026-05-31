@@ -3,10 +3,16 @@
 //! via channels. Decoupled from any TUI concerns.
 
 pub mod background;
+pub mod commands;
+pub mod events;
+pub mod execution;
 pub mod git_auto_commit;
 pub mod git_checkpoint;
+pub mod orchestrator;
+pub mod resource_manager;
 pub mod sub_agent;
 pub mod subtask_driver;
+pub mod traits;
 
 mod diagnose;
 mod discipline;

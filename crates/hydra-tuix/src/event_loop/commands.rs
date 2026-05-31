@@ -2033,12 +2033,13 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                         for a in &agents {
                             let id = a["id"].as_str().unwrap_or("-");
                             let short_id = &id[..8.min(id.len())];
+                            let kind = a["kind"].as_str().unwrap_or("execution");
                             let status = a["status"].as_str().unwrap_or("-");
                             let name = a["name"].as_str().unwrap_or("-");
                             let updated = a["updated_at"].as_u64().map(|t| t.to_string()).unwrap_or_else(|| "-".to_string());
                             out.push_str(&format!(
-                                "    {}  {}  {}  (updated: {})\n",
-                                short_id, status, name, updated
+                                "    {}  {}  {}  {}  (updated: {})\n",
+                                short_id, kind, status, name, updated
                             ));
                         }
                         out.push_str(&format!("  ({} agents total)\n", agents.len()));
@@ -2053,13 +2054,17 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                 }
             }
         }
-        [sub] if sub.eq_ignore_ascii_case("new") || sub.eq_ignore_ascii_case("create") => {
+        [sub, rest @ ..] if sub.eq_ignore_ascii_case("new") || sub.eq_ignore_ascii_case("create") => {
+            let arg = rest.join(" ");
             let mut payload = serde_json::json!({});
-            if let Some(worktree) = parse_arg(arg, &["--worktree", "-w"]) {
+            if let Some(worktree) = parse_arg(&arg, &["--worktree", "-w"]) {
                 payload["worktree_id"] = serde_json::json!(worktree);
             }
-            if let Some(branch) = parse_arg(arg, &["--branch", "-b"]) {
+            if let Some(branch) = parse_arg(&arg, &["--branch", "-b"]) {
                 payload["branch_name"] = serde_json::json!(branch);
+            }
+            if let Some(kind) = parse_arg(&arg, &["--kind", "-k"]) {
+                payload["metadata"] = serde_json::json!({"kind": kind});
             }
             match agents_post("/api/v1/agents", &payload) {
                 Ok(body) => {
@@ -2069,9 +2074,13 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                     let id = v["id"].as_str().unwrap_or("-");
                     let name = v["name"].as_str().unwrap_or("(unnamed)");
                     let status = v["status"].as_str().unwrap_or("-");
+                    let kind = v["metadata"].as_object()
+                        .and_then(|m| m.get("kind"))
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("execution");
                     renderer.render(UiLine::CommandOutput(format!(
-                        "  Created agent: {} ({}) [{}]\n",
-                        name, id, status
+                        "  Created {} agent: {} ({}) [{}]\n",
+                        kind, name, id, status
                     )));
                 }
                 Err(e) => {
@@ -2098,10 +2107,11 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                         .as_u64()
                         .map(|n| n.to_string())
                         .unwrap_or_else(|| "-".to_string());
+                    let kind = v["kind"].as_str().unwrap_or("execution");
                     let summary = v["summary"].as_str().unwrap_or("-");
                     let out = format!(
-                        "  Agent: {} ({})\n    Status:      {}\n    Provider:    {}\n    Working dir: {}\n    Session:     {}\n    Last event:  seq {}\n    Summary:     {}\n",
-                        name, full_id, status, provider, working_dir, session_id, last_event_seq, summary
+                        "  Agent: {} ({}) [{}]\n    Status:      {}\n    Provider:    {}\n    Working dir: {}\n    Session:     {}\n    Last event:  seq {}\n    Summary:     {}\n",
+                        name, full_id, kind, status, provider, working_dir, session_id, last_event_seq, summary
                     );
                     renderer.render(UiLine::CommandOutput(out));
                 }
@@ -2196,18 +2206,18 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
                                 let mut out = String::from("  Events:\n");
                                 for ev in events.iter().rev().take(20).rev() {
                                     let seq = ev["seq"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
-                                    let etype = ev["type"].as_str().unwrap_or("-");
+                                    let etype = ev["event_type"].as_str().unwrap_or("-");
                                     let ts = ev["timestamp"].as_u64().map(|t| t.to_string()).unwrap_or_else(|| "-".to_string());
-                                    let preview = ev["data"]
-                                        .as_str()
-                                        .or_else(|| ev["text"].as_str())
-                                        .unwrap_or("")
-                                        .chars()
-                                        .take(60)
-                                        .collect::<String>();
+                                    let preview = if let Some(delta) = ev["payload"].get("delta").and_then(|v| v.as_str()) {
+                                        delta.chars().take(80).collect()
+                                    } else if let Some(tool) = ev["payload"].get("tool").and_then(|v| v.as_str()) {
+                                        format!("tool:{}", tool)
+                                    } else {
+                                        String::new()
+                                    };
                                     out.push_str(&format!(
-                                        "    [{}] {} (ts:{}) {}\n",
-                                        seq, etype, ts, preview
+                                        "    [{}] {}  {}\n",
+                                        seq, etype, preview
                                     ));
                                 }
                                 renderer.render(UiLine::CommandOutput(out));
@@ -2265,7 +2275,7 @@ fn handle_agents(arg: &str, ctx: &mut LoopCtx, renderer: &mut dyn Renderer) {
         }
         _ => {
             renderer.render(UiLine::CommandOutput(
-                "  Usage: /agents, /agents <id>, /agents <id> start|cancel|events, /agents <id> input <text>, /agents new|create [--worktree <id>] [--branch <name>]\n"
+                "  Usage: /agents, /agents <id>, /agents <id> start|cancel|events, /agents <id> input <text>, /agents new|create [--worktree <id>] [--branch <name>] [--kind execution|orchestrator]\n"
                     .to_string(),
             ));
         }

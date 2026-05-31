@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{json_error, AppState, CachedMcpRegistry};
+use hydra_core::agent::resource_manager::ResourceManager;
 use hydra_core::config::Config;
 use hydra_core::mcp::{register_mcp_tools, McpRegistry};
 use hydra_core::provider;
@@ -50,6 +51,7 @@ pub struct AgentErrorInfo {
 pub struct AgentSnapshot {
     pub id: String,
     pub name: String,
+    pub kind: String, // "execution" or "orchestrator"
     pub status: AgentStatus,
     pub provider: Option<String>,
     pub working_dir: String,
@@ -221,6 +223,7 @@ pub struct AgentRegistry {
     active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
     mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     event_broadcasts: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
+    rm: ResourceManager,
 }
 
 impl AgentRegistry {
@@ -231,6 +234,7 @@ impl AgentRegistry {
             active_tokens: Arc::new(RwLock::new(HashMap::new())),
             mcp_cache,
             event_broadcasts: Arc::new(RwLock::new(HashMap::new())),
+            rm: ResourceManager::new(),
         }
     }
 
@@ -239,9 +243,17 @@ impl AgentRegistry {
         let now = now_ts();
         let working_dir = req.working_dir.unwrap_or_else(|| default_working_dir.to_string());
         let branch_name = req.branch_name.or_else(|| detect_branch_from_dir(&working_dir));
+        let kind = req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("execution")
+            .to_string();
         let agent = AgentSnapshot {
             id: id.clone(),
             name: req.name.unwrap_or_else(|| format!("agent-{}", &id[..8])),
+            kind,
             status: AgentStatus::Created,
             provider: req.provider,
             working_dir,
@@ -420,14 +432,14 @@ impl AgentRegistry {
         active_tokens.write().await.insert(agent_id.clone(), cancel_token.clone());
 
         tokio::spawn(async move {
-            let (working_dir, _worktree_id) = match {
+            let (working_dir, _worktree_id, kind) = match {
                 let s = store.read().await;
-                s.get(&agent_id).map(|a| (a.working_dir.clone(), a.worktree_id.clone()))
+                s.get(&agent_id).map(|a| (a.working_dir.clone(), a.worktree_id.clone(), a.kind.clone()))
             } {
-                Some((d, wt)) => {
+                Some((d, wt, k)) => {
                     let resolved = wt.as_ref()
                         .and_then(|wt_id| resolve_worktree_path(&d, wt_id));
-                    (resolved.unwrap_or(d), wt)
+                    (resolved.unwrap_or(d), wt, k)
                 }
                 None => {
                     set_status(&store, &agent_id, AgentStatus::Failed).await;
@@ -436,6 +448,25 @@ impl AgentRegistry {
                     return;
                 }
             };
+
+            if kind == "orchestrator" {
+                let result = run_orchestrator_execution(
+                    store.clone(),
+                    event_store.clone(),
+                    event_broadcasts.clone(),
+                    active_tokens.clone(),
+                    mcp_cache.clone(),
+                    agent_id.clone(),
+                    working_dir,
+                    input_text,
+                    cancel_token,
+                ).await;
+                if result.is_err() {
+                    set_status(&store, &agent_id, AgentStatus::Failed).await;
+                }
+                active_tokens.write().await.remove(&agent_id);
+                return;
+            }
 
             // Try real execution; fall back to mock on any error
             let result = run_real_execution(
@@ -458,6 +489,64 @@ impl AgentRegistry {
         });
     }
 
+}
+
+impl hydra_core::agent::orchestrator::AgentControl for AgentRegistry {
+    fn create_execution(&self, task: &str, branch: Option<&str>, worktree: Option<&str>) -> String {
+        let default_dir = std::env::current_dir()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        let req = CreateAgentRequest {
+            name: Some(format!("exec-{}", &task.chars().take(20).collect::<String>())),
+            provider: None,
+            working_dir: Some(default_dir.clone()),
+            session_id: None,
+            initial_input: Some(task.to_string()),
+            metadata: None,
+            worktree_id: worktree.map(|s| s.to_string()),
+            branch_name: branch.map(|s| s.to_string()),
+        };
+        let rt = tokio::runtime::Handle::current();
+        let agent = rt.block_on(async { self.create(req, &default_dir).await });
+        agent.id
+    }
+
+    fn start_agent(&self, id: &str, message: &str) {
+        let rt = tokio::runtime::Handle::current();
+        let cmd = PostAgentCommandRequest {
+            type_: "start".to_string(),
+            payload: Some(serde_json::json!({"message": message})),
+        };
+        let _ = rt.block_on(async { self.post_command(id, cmd).await });
+    }
+
+    fn cancel_agent(&self, id: &str) {
+        let rt = tokio::runtime::Handle::current();
+        let cmd = PostAgentCommandRequest {
+            type_: "cancel".to_string(),
+            payload: None,
+        };
+        let _ = rt.block_on(async { self.post_command(id, cmd).await });
+    }
+
+    fn agent_status(&self, id: &str) -> Option<String> {
+        let rt = tokio::runtime::Handle::current();
+        let agent = rt.block_on(async { self.get(id).await });
+        agent.map(|a| format!("{:?}", a.status).to_lowercase())
+    }
+
+    fn list_agents(&self) -> Vec<(String, String)> {
+        let rt = tokio::runtime::Handle::current();
+        let agents = rt.block_on(async { self.list().await });
+        agents
+            .into_iter()
+            .map(|a| (a.id, format!("{:?}", a.status).to_lowercase()))
+            .collect()
+    }
+
+    fn set_self_status(&self, _status: &str) {
+        // Orchestrator running within AgentRegistry would update via post_command path
+    }
 }
 
 /// Shared mock progression logic used as fallback.
@@ -590,6 +679,296 @@ fn resolve_worktree_path(repo_dir: &str, branch: &str) -> Option<String> {
         }
     }
     None
+}
+
+async fn run_orchestrator_execution(
+    store: Arc<RwLock<AgentStore>>,
+    event_store: Arc<RwLock<AgentEventStore>>,
+    event_broadcasts: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
+    active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
+    agent_id: String,
+    working_dir: String,
+    input_text: Option<String>,
+    _cancel_token: CancellationToken,
+) -> Result<(), ()> {
+    use hydra_core::agent::orchestrator::OrchestratorAgent;
+    use hydra_core::agent::traits::{Agent, AgentId};
+
+    let config_path = Config::default_path();
+    let config = Config::load(&config_path).map_err(|_| ())?;
+    let provider_name = config.default_provider.clone();
+    let provider_config = config.providers.get(&provider_name).ok_or(())?.clone();
+    let provider = provider::create_provider(&provider_config).map_err(|_| ())?;
+
+    let system_prompt = format!(
+        "You are an orchestrator agent coordinating a team of execution agents.\n\
+         \n\
+         Working directory: {}\n\
+         \n\
+         ## Your tools\n\
+         - spawn_execution(task, branch?): Create and start a worker agent to execute a task.\n\
+           Use this to delegate coding work. Returns the new agent's ID.\n\
+         - inspect_agent(agent_id): Check the status of a child agent.\n\
+         - kill_agent(agent_id): Cancel a running child agent.\n\
+         - declare_complete(summary): Call this when all work is done to report the final result.\n\
+           Do NOT call inspect_agent in a loop. Check once, then move on.\n\
+         \n\
+         ## Workflow\n\
+         1. Analyze the user's request. If it involves writing code, spawn one or more\n\
+            execution agents with specific, well-scoped tasks.\n\
+         2. Monitor your child agents using inspect_agent.\n\
+         3. When child agents complete, evaluate their results. Spawn more if needed.\n\
+         4. When the full task is complete, summarize what was done.\n\
+         5. If you need clarification from the user, ask. Otherwise proceed without asking.\n\
+         \n\
+         Be autonomous. Prefer spawning agents over asking questions.",
+        working_dir
+    );
+
+    let control_arc: std::sync::Arc<dyn hydra_core::agent::orchestrator::AgentControl> =
+        std::sync::Arc::new(AgentControlBridge {
+            store: store.clone(),
+            event_store: event_store.clone(),
+            event_broadcasts: event_broadcasts.clone(),
+            default_working_dir: working_dir.clone(),
+            self_agent_id: agent_id.clone(),
+            active_tokens: active_tokens.clone(),
+            mcp_cache: mcp_cache.clone(),
+        });
+
+    let mut orch = OrchestratorAgent::new(
+        AgentId(0),
+        PathBuf::from(&working_dir),
+        config,
+        provider_config,
+        provider,
+        system_prompt,
+        control_arc,
+    );
+
+    // Set up event forwarding: orchestrator TurnEvents → daemon event system
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<hydra_core::agent::commands::AgentEvent>();
+    orch.set_event_tx(evt_tx);
+    let fwd_broadcasts = event_broadcasts.clone();
+    let fwd_agent_id = agent_id.clone();
+    let fwd_event_store = event_store.clone();
+    tokio::spawn(async move {
+        while let Some(evt) = evt_rx.recv().await {
+            // Map orchestrated AgentEvent to daemon AgentEvent
+            let daemon_evt = match &evt {
+                hydra_core::agent::commands::AgentEvent::Turn { data, .. } => AgentEvent {
+                    seq: 0, agent_id: fwd_agent_id.clone(),
+                    event_type: "agent_message".to_string(),
+                    timestamp: now_ts(),
+                    payload: data.get("delta").cloned(),
+                },
+                hydra_core::agent::commands::AgentEvent::ToolCall { tool, success, .. } => AgentEvent {
+                    seq: 0, agent_id: fwd_agent_id.clone(),
+                    event_type: if *success { "tool_call_result" } else { "tool_call_start" }.to_string(),
+                    timestamp: now_ts(),
+                    payload: Some(serde_json::json!({"tool": tool, "success": success})),
+                },
+                _ => continue,
+            };
+            // Store + broadcast
+            let seq = {
+                let es = fwd_event_store.read().await;
+                es.events.get(&fwd_agent_id).map(|v| v.len() as u64 + 1).unwrap_or(1)
+            };
+            let stored_evt = AgentEvent {
+                seq,
+                agent_id: daemon_evt.agent_id.clone(),
+                event_type: daemon_evt.event_type.clone(),
+                timestamp: daemon_evt.timestamp,
+                payload: daemon_evt.payload.clone(),
+            };
+            {
+                let mut es = fwd_event_store.write().await;
+                es.append(&fwd_agent_id, stored_evt.clone());
+            }
+            if let Some(tx) = fwd_broadcasts.read().await.get(&fwd_agent_id) {
+                let _ = tx.send(stored_evt);
+            }
+        }
+    });
+
+    set_status(&store, &agent_id, AgentStatus::Running).await;
+
+    let resources = hydra_core::agent::traits::ResourceHandle {
+        event_tx: tokio::sync::mpsc::unbounded_channel().0,
+        control_tx: tokio::sync::mpsc::unbounded_channel().0,
+        tool_registry: std::sync::Arc::new(tokio::sync::RwLock::new(hydra_core::tool::ToolRegistry::new())),
+        working_dir: PathBuf::from(&working_dir),
+    };
+
+    // Inject initial task if provided
+    if let Some(ref task) = input_text {
+        let _ = orch.on_command(
+            hydra_core::agent::commands::AgentCommand::SubmitTask { description: task.clone() }
+        ).await;
+    }
+
+    let outcome = orch.run(resources).await;
+
+    match outcome {
+        Ok(hydra_core::agent::traits::AgentOutcome::Success { summary }) => {
+            set_status(&store, &agent_id, AgentStatus::Completed).await;
+            append_event(&event_store, &event_broadcasts, &agent_id, "status_changed",
+                Some(serde_json::json!({"status": "completed", "summary": summary}))).await;
+        }
+        Ok(hydra_core::agent::traits::AgentOutcome::Failed { error }) => {
+            set_status(&store, &agent_id, AgentStatus::Failed).await;
+            append_event(&event_store, &event_broadcasts, &agent_id, "status_changed",
+                Some(serde_json::json!({"status": "failed", "error": error}))).await;
+        }
+        Ok(_) => {
+            set_status(&store, &agent_id, AgentStatus::Completed).await;
+        }
+        Err(e) => {
+            set_status(&store, &agent_id, AgentStatus::Failed).await;
+            append_event(&event_store, &event_broadcasts, &agent_id, "status_changed",
+                Some(serde_json::json!({"status": "failed", "error": format!("{}", e)}))).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Bridge from OrchestratorAgent's AgentControl trait to AgentRegistry's internal methods.
+struct AgentControlBridge {
+    store: Arc<RwLock<AgentStore>>,
+    event_store: Arc<RwLock<AgentEventStore>>,
+    event_broadcasts: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>>>,
+    active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
+    default_working_dir: String,
+    self_agent_id: String,
+}
+
+impl hydra_core::agent::orchestrator::AgentControl for AgentControlBridge {
+    fn create_execution(&self, task: &str, branch: Option<&str>, worktree: Option<&str>) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_ts();
+        let br = branch.map(|s| s.to_string())
+            .or_else(|| detect_branch_from_dir(&self.default_working_dir));
+        let agent = AgentSnapshot {
+            id: id.clone(),
+            name: format!("exec-{}", &id[..8]),
+            kind: "execution".to_string(),
+            status: AgentStatus::Created,
+            provider: None,
+            working_dir: self.default_working_dir.clone(),
+            session_id: None,
+            created_at: now,
+            updated_at: now,
+            last_event_seq: 0,
+            summary: None,
+            last_error: None,
+            worktree_id: worktree.map(|s| s.to_string()),
+            branch_name: br,
+            parent_agent_id: Some(id.clone()),
+            pending_input: Some(task.to_string()),
+        };
+        tokio::task::block_in_place(|| {
+            self.store.blocking_write().insert(agent);
+        });
+        id
+    }
+
+    fn start_agent(&self, id: &str, _message: &str) {
+        // Spawn actual execution for the child agent
+        let child_id = id.to_string();
+        let store = self.store.clone();
+        let event_store = self.event_store.clone();
+        let event_broadcasts = self.event_broadcasts.clone();
+        let active_tokens = self.active_tokens.clone();
+        let mcp_cache = self.mcp_cache.clone();
+        let working_dir = self.default_working_dir.clone();
+        // Read the task from pending_input
+        let input_text = tokio::task::block_in_place(|| {
+            self.store.blocking_read().get(id).and_then(|a| a.pending_input.clone())
+        });
+        // Update status first
+        tokio::task::block_in_place(|| {
+            self.store.blocking_write().update_status(id, AgentStatus::Queued);
+        });
+        // Spawn the execution in a background thread (not tokio, since we're in block_in_place)
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let cancel_token = CancellationToken::new();
+                active_tokens.write().await.insert(child_id.clone(), cancel_token.clone());
+                let result = run_real_execution(
+                    store.clone(),
+                    event_store.clone(),
+                    event_broadcasts.clone(),
+                    child_id.clone(),
+                    working_dir,
+                    input_text,
+                    cancel_token,
+                    mcp_cache,
+                ).await;
+                if let Err(_) = result {
+                    run_mock_progression(store, event_store, event_broadcasts, child_id.clone()).await;
+                }
+                active_tokens.write().await.remove(&child_id);
+            });
+        });
+    }
+
+    fn cancel_agent(&self, id: &str) {
+        tokio::task::block_in_place(|| {
+            self.store.blocking_write().update_status(id, AgentStatus::Cancelled);
+        });
+    }
+
+    fn agent_status(&self, id: &str) -> Option<String> {
+        tokio::task::block_in_place(|| {
+            self.store.blocking_read().get(id)
+                .map(|a| format!("{:?}", a.status).to_lowercase())
+        })
+    }
+
+    fn list_agents(&self) -> Vec<(String, String)> {
+        tokio::task::block_in_place(|| {
+            self.store.blocking_read().list()
+                .into_iter()
+                .map(|a| (a.id, format!("{:?}", a.status).to_lowercase()))
+                .collect()
+        })
+    }
+
+    fn set_self_status(&self, status: &str) {
+        tokio::task::block_in_place(|| {
+            let s = match status {
+                "running" => AgentStatus::Running,
+                "waiting_input" => AgentStatus::WaitingInput,
+                "completed" => AgentStatus::Completed,
+                "failed" => AgentStatus::Failed,
+                _ => return,
+            };
+            self.store.blocking_write().update_status(&self.self_agent_id, s.clone());
+            // Also emit event to broadcasts for TUI visibility
+            let mut es = self.event_store.blocking_write();
+            let seq = es.events.get(&self.self_agent_id).map(|v| v.len() as u64 + 1).unwrap_or(1);
+            let event = AgentEvent {
+                seq,
+                agent_id: self.self_agent_id.clone(),
+                event_type: "status_changed".to_string(),
+                timestamp: now_ts(),
+                payload: Some(serde_json::json!({"status": status})),
+            };
+            es.append(&self.self_agent_id, event.clone());
+            drop(es);
+            if let Some(tx) = self.event_broadcasts.blocking_read().get(&self.self_agent_id) {
+                let _ = tx.send(event);
+            }
+        });
+    }
 }
 
 /// Try to execute a real LLM turn loop for the given agent.

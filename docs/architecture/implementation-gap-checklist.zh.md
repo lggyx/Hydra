@@ -55,10 +55,10 @@
 - 路由参数风格已统一为 axum `:param` 语法
 - 已补 `agent_smoke_create_list_start_events` 黑盒测试：完整走 Router 验证 agent 创建→列表→详情→start→事件查询的端到端链路
 
-### E. `overview.md` 描述的 Agent trait / ResourceManager 架构与实现不一致
-- 文档第 2-5、8、12 节描述的目标架构（Agent trait、ResourceManager、OrchestratorAgent、hydra-workspace crate）与当前 `AgentLoop` 通道驱动架构不同
-- 处理：`overview.md` 相关章节已标注为「规划态」，新增 `current-implementation-contract.md` 描述当前真实实现
-- 长期目标：按 Agent trait 架构重构（见方案 B 规划）
+### E. Agent trait 架构已部分实现（2026-05-31 更新）
+- Section 3-5（Agent trait / ResourceManager / ExecutionAgent / OrchestratorAgent）已实现，标记移除
+- Section 2、8、12（System Topology / Crate Structure / Implementation Sequence）仍为「规划态」
+- 已合入 develop，详见 `crates/hydra-core/src/agent/` 目录下 `traits.rs`、`execution.rs`、`orchestrator.rs`、`resource_manager.rs`
 
 ### F. 设计规范文档 `docs/superpowers/specs/` 缺失
 - `team-assignment.zh.md` 和 `module-contract-cards.zh.md` 引用的设计规范不存在
