@@ -6,29 +6,26 @@ import ssl
 import sys
 from urllib import error, parse, request
 
-REPO_OWNER = "bangxu"
-REPO_NAME = "atomcode"
+REPO_OWNER = "atomgit_atomcode"
+REPO_NAME = "hydra"
 ACCESS_TOKEN = ""
 API_HOST = "https://api.gitcode.com"
 BODY_TEMPLATE = """
-Release  Note
+Hydra Release Note
 
 使用于mac和linux的当前最新版本，安装命令如下
 
 ```bash
-# 进入 ~/.local/bin 目录
-cd ~/.local/bin
-
-# 通过 Finder 打开目录
-open .
-
-# 将下载后的 atomcode-xxx 文件放入到目录，重命名为 atomcode
-
-# 设置 atomcode 的运行权限
-chmod +x atomcode
+curl -fsSL https://atomgit.com/atomgit_atomcode/hydra/releases/download/{tag_name}/install.sh | sh
 ```
 
-最后，在终端中输入 atomcode 并运行即可
+Windows PowerShell:
+
+```powershell
+irm https://atomgit.com/atomgit_atomcode/hydra/releases/download/{tag_name}/install.ps1 | iex
+```
+
+最后，在终端中输入 hydra 并运行即可。
 """
 
 
@@ -95,7 +92,7 @@ def send_request(url: str, method: str = "GET", payload: dict | None = None) -> 
 def create_tag_release(args: argparse.Namespace) -> dict:
     base_url = f"{API_HOST}/api/v5/repos/{args.owner}/{args.repo}/releases"
     url = f"{base_url}?access_token={parse.quote(args.access_token)}"
-    body = args.body or BODY_TEMPLATE.replace("atomcode-v2.3.x", args.tag_name)
+    body = args.body or BODY_TEMPLATE.format(tag_name=args.tag_name)
 
     payload = {
         "tag_name": args.tag_name,

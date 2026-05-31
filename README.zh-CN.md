@@ -129,6 +129,22 @@ Hydra 是一款住在你终端里的 AI 编码助手。用自然语言给它一�
 
 ## 安装
 
+### 一键脚本
+
+```bash
+curl -fsSL https://atomgit.com/atomgit_atomcode/hydra/releases/download/v4.23.3/install.sh | sh
+```
+
+Windows PowerShell：
+
+```powershell
+irm https://atomgit.com/atomgit_atomcode/hydra/releases/download/v4.23.3/install.ps1 | iex
+```
+
+脚本会自动下载当前平台对应的 release 二进制。在 macOS / Linux / HarmonyOS PC
+上安装到 `/usr/local/bin` 或 `~/.local/bin`，在 Windows 上安装到
+`%LOCALAPPDATA%\Hydra`。
+
 ### 从源码构建（推荐）
 
 ```bash

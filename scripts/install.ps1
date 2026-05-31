@@ -1,6 +1,6 @@
 # Hydra installer for Windows — PowerShell
 #
-#   irm https://atomgit.com/atomgit_atomcode/hydra/raw/main/install.ps1 | iex
+#   irm https://atomgit.com/atomgit_atomcode/hydra/releases/download/v4.23.3/install.ps1 | iex
 #
 # Env overrides:
 #   $env:HYDRA_VERSION   release tag to install (default: v4.23.3)
