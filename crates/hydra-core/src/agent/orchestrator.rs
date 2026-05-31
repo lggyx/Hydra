@@ -3,12 +3,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use super::commands::AgentEvent;
 use super::traits::{Agent, AgentId, AgentKind, AgentOutcome, AgentResponse, AgentState, AgentStatus, ResourceHandle};
 use crate::config::Config;
+use crate::conversation::Conversation;
 use crate::provider::LlmProvider;
 use crate::tool::{ApprovalRequirement, Tool, ToolContext, ToolDef, ToolResult};
 use crate::turn::event::TurnEvent;
@@ -34,9 +35,12 @@ pub struct OrchestratorAgent {
     control: Arc<dyn AgentControl>,
     cancel_token: CancellationToken,
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+    pending_input: Option<String>,
+    notify: Arc<Notify>,
 }
 
 impl OrchestratorAgent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: AgentId,
         working_dir: PathBuf,
@@ -68,6 +72,8 @@ impl OrchestratorAgent {
             control,
             cancel_token: CancellationToken::new(),
             event_tx: None,
+            pending_input: None,
+            notify: Arc::new(Notify::new()),
         }
     }
 }
@@ -91,7 +97,6 @@ impl Agent for OrchestratorAgent {
         let tool_context = crate::tool::ToolContext::new(working_dir_path.clone());
         let mut tool_registry = crate::tool::ToolRegistry::new();
 
-        // Orchestrator meta-tools
         let spawn_tool = SpawnExecutionTool { control: self.control.clone() };
         let kill_tool = KillAgentTool { control: self.control.clone() };
         let inspect_tool = InspectAgentTool { control: self.control.clone() };
@@ -128,20 +133,40 @@ impl Agent for OrchestratorAgent {
             loop_guard: Default::default(),
         };
 
-        let mut conversation = crate::conversation::Conversation::new();
+        let mut conversation = Conversation::new();
         let (turn_tx, mut turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+        let mut last_response = String::new();
 
-        let final_summary = loop {
+        loop {
             if self.cancel_token.is_cancelled() {
                 return Ok(AgentOutcome::Failed { error: "cancelled".to_string() });
             }
+
+            if let Some(input) = self.pending_input.take() {
+                conversation.add_user_message(&input);
+            }
+
             while let Ok(_) = turn_rx.try_recv() {}
             let result = turn_runner
                 .run(&mut conversation, &self.system_prompt, &turn_tx, self.cancel_token.clone())
                 .await;
             while let Ok(_) = turn_rx.try_recv() {}
+
             match result {
-                crate::turn::event::TurnResult::Responded { text, .. } => break text,
+                crate::turn::event::TurnResult::Responded { text, .. } => {
+                    last_response = text;
+                    {
+                        let mut s = self.state.write().await;
+                        s.status = AgentStatus::WaitingInput;
+                        s.updated_at = now_ts();
+                    }
+                    tokio::select! {
+                        _ = self.notify.notified() => continue,
+                        _ = self.cancel_token.cancelled() => {
+                            return Ok(AgentOutcome::Failed { error: "cancelled".to_string() });
+                        }
+                    }
+                }
                 crate::turn::event::TurnResult::UsedTools { .. } => continue,
                 crate::turn::event::TurnResult::Failed(e) => {
                     return Ok(AgentOutcome::Failed { error: e });
@@ -150,18 +175,29 @@ impl Agent for OrchestratorAgent {
                     return Ok(AgentOutcome::Failed { error: "cancelled".to_string() });
                 }
             }
-        };
-
-        Ok(AgentOutcome::Success { summary: final_summary })
+        }
     }
 
     async fn on_command(&mut self, cmd: super::commands::AgentCommand) -> AgentResponse {
         match cmd {
             super::commands::AgentCommand::Kill { reason: _ } => {
                 self.cancel_token.cancel();
+                self.notify.notify_one();
                 AgentResponse::Ack
             }
-            super::commands::AgentCommand::SubmitTask { description: _ } => AgentResponse::Ack,
+            super::commands::AgentCommand::InjectHint { text } => {
+                self.pending_input = Some(text);
+                self.notify.notify_one();
+                AgentResponse::Ack
+            }
+            super::commands::AgentCommand::SubmitTask { description } => {
+                self.pending_input = Some(description);
+                self.notify.notify_one();
+                AgentResponse::Ack
+            }
+            super::commands::AgentCommand::Pause | super::commands::AgentCommand::Resume => {
+                AgentResponse::Reject { reason: "pause/resume not supported".to_string() }
+            }
             _ => AgentResponse::Reject { reason: "unsupported".to_string() },
         }
     }
